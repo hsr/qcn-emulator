@@ -123,13 +123,14 @@ struct htb_class {
 	psched_tdiff_t mbuffer;	/* max wait time */
 	long tokens, ctokens;	/* current number of tokens */
 	psched_time_t t_c;	/* checkpoint time */
+	psched_time_t t_p; 	/* time - 1sec */
 
 	/* QCN variables */
 	__u32 qcn_TR;
 	__u32 qcn_CR;
 	__u32 qcn_byte_ctr;
-	__u16  qcn_byte_state;
-	__u16  qcn_timer_state;
+	__u16 qcn_byte_state;
+	__u16 qcn_timer_state;
 	psched_time_t qcn_timer;
 
 	/* QCN parameters */
@@ -1380,6 +1381,8 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 			kfree(cl);
 			goto failure;
 		}
+
+		cl->t_p = psched_get_time();
 
 		cl->refcnt = 1;
 		cl->children = 0;
