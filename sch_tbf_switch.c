@@ -142,8 +142,9 @@ struct qcn_frame {
 #define L2T(q,L)   qdisc_l2t((q)->R_tab,L)
 #define L2T_P(q,L) qdisc_l2t((q)->P_tab,L)
 
-/* The right way to do this is using one queue and one thread
-   (producer-consumer)  */
+/* The right way to do this is by using one queue and one thread
+   (producer-consumer). Don't use this qdisc on an interface. It's
+   developed to be on a bridge interface. */
 static int qcn_send_fb (struct socket *sock, struct sockaddr_in *addr, 
 						struct qcn_frame *frame, long ip_dst)
 {
@@ -155,8 +156,8 @@ static int qcn_send_fb (struct socket *sock, struct sockaddr_in *addr,
 
 	/* Connecting and sending the packet */
 	addr->sin_port = htons(LISTEN_PORT);
-	addr->sin_addr.s_addr = ip_dst & htonl(0xFFFF00FF);
 	/* addr->sin_addr.s_addr = htonl(0x7f000001); */
+	addr->sin_addr.s_addr = ip_dst & htonl(0xFFFF00FF);
 	/* The "AND 0xFFFF00FF" is a "workaround" to send the packet
 	   to the physical machine's IP instead of the virtual
 	   machine's IP (which was sampled). This code assumes that
@@ -263,7 +264,7 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 			frame.qoff = htonl(q->Q_EQ - q->qlen);
 			frame.qdelta = htonl(q->qlen - q->qlen_old);
 			
-			q->sending_fb = 1; 	/* Avoiding infinite loop */
+			q->sending_fb = 1; 	/* Avoiding infinite loop -- doesnt work*/
 			if ((ret = qcn_send_fb(q->sock, &q->addr, &frame, frame.SA)) > 0) {
 				printk(KERN_INFO "qntz_Fb of 0x%x was sent to PM address 0x%x",
 					   qntz_Fb, q->addr.sin_addr.s_addr);
