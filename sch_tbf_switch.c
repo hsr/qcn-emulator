@@ -155,9 +155,11 @@ static int qcn_send_fb (struct socket *sock, struct sockaddr_in *addr,
 
 
 	/* Connecting and sending the packet */
+	memset(addr, 0, sizeof(struct sockaddr));
+	addr->sin_family = AF_INET;
 	addr->sin_port = htons(LISTEN_PORT);
-	/* addr->sin_addr.s_addr = htonl(0x7f000001); */
-	addr->sin_addr.s_addr = ip_dst & htonl(0xFFFF00FF);
+	addr->sin_addr.s_addr = htonl(0x7f000001);
+	/* addr->sin_addr.s_addr = ip_dst & htonl(0xFFFF00FF); */
 	/* The "AND 0xFFFF00FF" is a "workaround" to send the packet
 	   to the physical machine's IP instead of the virtual
 	   machine's IP (which was sampled). This code assumes that
@@ -253,7 +255,7 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 			/* Since we are using IP addresses, we cant sample non-IP
 			   packets. */
 
-			printk(KERN_INFO "Sending Fb...");
+			printk(KERN_EMERG "Sending Fb...");
 
 			/* Filling the qcn_frame structure */
 			memset(&frame, 0, sizeof(struct qcn_frame));
@@ -266,15 +268,15 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 			
 			q->sending_fb = 1; 	/* Avoiding infinite loop -- doesnt work*/
 			if ((ret = qcn_send_fb(q->sock, &q->addr, &frame, frame.SA)) > 0) {
-				printk(KERN_INFO "qntz_Fb of 0x%x was sent to PM address 0x%x",
+				printk(KERN_EMERG "qntz_Fb of 0x%x was sent to PM address 0x%x",
 					   qntz_Fb, q->addr.sin_addr.s_addr);
 			} else {
-				printk(KERN_WARNING "Could not send qntz_Fb! ret = %d", ret);
+				printk(KERN_EMERG "Could not send qntz_Fb! ret = %d", ret);
 			}
 			q->sending_fb = 0;
 		}
 	} else {
-		printk(KERN_WARNING "Already sending Fb!");
+		printk(KERN_EMERG "Already sending Fb!");
 	}
 	/* End QCN Algorithm */
 
@@ -475,7 +477,7 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 		q->qdisc = &noop_qdisc;
 
 		/* QCN Parameters */
-		printk(KERN_WARNING "Initializing QCN CP parameters");
+		printk(KERN_EMERG "Initializing QCN CP parameters");
 		q->Q_EQ = 33792; 			/* 33KB */
 		q->W = 2;
 
@@ -487,7 +489,7 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 
 		/* Creating a socket to send udp messages */
 		if (sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &q->sock) < 0) {
-			printk(KERN_INFO "Could not create the send socket, error = %d\n",
+			printk(KERN_EMERG "Could not create the send socket, error = %d\n",
 				   -ENXIO);
 		}
 

@@ -40,8 +40,14 @@
 #include <net/netlink.h>
 #include <net/pkt_sched.h>
 
+#include <linux/init.h>
 #include <linux/kthread.h>
 #include <linux/ip.h>
+#include <linux/delay.h>
+#include <linux/smp_lock.h>
+#include <linux/signal.h>
+#include <linux/sched.h>
+
 #define LISTEN_PORT 6660
 
 /* HTB algorithm.
@@ -155,7 +161,7 @@ struct kthread_t
 	struct task_struct *thread;
 	struct socket *sock;
 	struct sockaddr_in addr;
-	struct Qdisc *sch;
+	struct Qdisc *q;
 	int running;
 };
 
@@ -780,20 +786,67 @@ static struct rb_node *htb_id_find_next_upper(int prio, struct rb_node *n,
 
 static void qcn_feedback_controller(struct htb_sched *q)
 {
-	int err;
+	int err, size;
+	struct qcn_frame frame;
+	
+    /* Kernel thread initialization */
+	lock_kernel();
+	q->t->running = 1;
+	current->flags |= PF_NOFREEZE;
+	
+    /* Daemonize (take care with signals, after daemonize() they are
+	   disabled) */
+	daemonize("QCN Feedback Controller");
+	allow_signal(SIGKILL);
+	unlock_kernel();
+
+	printk(KERN_EMERG "Kernel thread was created");
+
 	/* Creating a socket to recv udp messages */
 	if (sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &q->t->sock) < 0) {
-		printk(KERN_INFO "Could not create the recv socket, error = %d\n",
+		printk(KERN_EMERG "Could not create the recv socket, error = %d\n",
 			   -ENXIO);
+		goto out;
 	}
 
+	memset(&q->t->addr, 0, sizeof(struct sockaddr));
+	q->t->addr.sin_family = AF_INET;
 	q->t->addr.sin_port = htons(LISTEN_PORT);
 	q->t->addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	if ((err = q->t->sock->ops->bind(q->t->sock, (struct sockaddr *)&q->t->addr,
 									 sizeof(struct sockaddr))) < 0) {
-		printk(KERN_INFO "Could not bind the recv socket, error = %d\n",
+		printk(KERN_EMERG "Could not bind the recv socket, error = %d\n",
 			   err);
+		goto close_and_out;
 	}
+
+	for (;;) {
+		memset(&frame, 0, sizeof(struct qcn_frame));
+		
+		size = 0;
+		/* size = qcn_recv_fb(q->t->sock, &q->t->addr, frame, */
+		/* 				   sizeof(struct qcn_frame)); */
+
+		if (signal_pending(current))
+			break;
+
+		if (size < 0)
+			printk(KERN_EMERG "Error %d while recving Fb\n", size);
+		else 
+		{
+			printk(KERN_EMERG "Received %d bytes\n", size);
+		}
+
+	}
+
+close_and_out:
+	sock_release(q->t->sock);
+	q->t->sock = NULL;
+
+out:
+	q->t->thread = NULL;
+	q->t->running = 0;
+
 }
 
 /**
@@ -1098,7 +1151,7 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 	q->defcls = gopt->defcls;
 
 	/* QCN Parameters */
-	printk(KERN_WARNING "Initializing QCN RP parameters");
+	printk(KERN_EMERG "Initializing QCN RP parameters");
 
 	q->qcn_TIMER = 25;
 	q->qcn_FASTREC = 5;
@@ -1112,16 +1165,19 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 
 
 	/* Creating the Feedback Controller thread */
+	q->t = NULL;
 	q->t = kmalloc(sizeof(struct kthread_t), GFP_KERNEL);
 	memset(q->t, 0, sizeof(struct kthread_t));
-	q->t->thread = kthread_run((void *)qcn_feedback_controller,
-							   q, "QCN Feedback Controller");
+	q->t->sock = NULL; 
+	/* q->t->thread = kthread_run((void *)qcn_feedback_controller, */
+	/* 						   q, "QCN Feedback Controller"); */
 	if (IS_ERR(q->t->thread))
 	{
-		printk(KERN_WARNING "Unable to start kernel thread\n");
+		printk(KERN_EMERG "Unable to start kernel thread\n");
 		kfree(q->t);
 		q->t = NULL;
 	}
+	kfree(q->t);
 
 	return 0;
 }
@@ -1310,6 +1366,33 @@ static void htb_destroy(struct Qdisc *sch)
 	struct hlist_node *n, *next;
 	struct htb_class *cl;
 	unsigned int i;
+	int err;
+
+	/* Destroying the Feedback Controller thread and releasing its
+	   socket */
+	if (q->t->thread == NULL) {
+		printk(KERN_EMERG "No kernel thread to kill\n");
+	} else {
+		lock_kernel();
+		err = kill_pid(task_pid(q->t->thread), SIGKILL, 1);
+		unlock_kernel();
+		
+		/* Wait for kernel thread to die */
+		if (err < 0)
+			printk(KERN_EMERG "Error %d while killing kernel thread", err);
+		else
+		{
+			while (q->t->running == 1)
+				msleep(10);
+			printk(KERN_EMERG "Succesfully killed kernel thread!");
+		}
+	}
+	if (q->t->sock != NULL) {
+		sock_release(q->t->sock);
+		q->t->sock = NULL;
+	}
+	kfree(q->t);
+	q->t = NULL;
 
 	cancel_work_sync(&q->work);
 	qdisc_watchdog_cancel(&q->watchdog);
@@ -1330,6 +1413,7 @@ static void htb_destroy(struct Qdisc *sch)
 	}
 	qdisc_class_hash_destroy(&q->clhash);
 	__skb_queue_purge(&q->direct_queue);
+
 }
 
 static int htb_delete(struct Qdisc *sch, unsigned long arg)
