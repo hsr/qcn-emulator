@@ -21,6 +21,8 @@
 #include <net/netlink.h>
 #include <net/pkt_sched.h>
 
+#include <linux/ip.h>
+#define LISTEN_PORT 6660
 
 /*	Simple Token Bucket Filter.
 	=======================================
@@ -139,6 +141,68 @@ struct qcn_frame {
 #define L2T(q,L)   qdisc_l2t((q)->R_tab,L)
 #define L2T_P(q,L) qdisc_l2t((q)->P_tab,L)
 
+static int qcn_send_fb (struct socket *sock, struct sk_buff *skb,
+						struct sockaddr_in *addr, unsigned char *frame,
+						u32 qntz_Fb)
+{
+	struct qcn_frame frame;
+	struct iphdr *iph;
+	struct msghdr msg;
+	struct iovec iov;
+	mm_segment_t oldfs;
+	int size = 0;
+
+	printk(KERN_INFO "Sending Fb...");
+	/* Filling the qcn_frame structure */
+	memset(&frame, 0, sizeof(struct qcn_frame));
+	iph = ip_hdr(skb);
+	frame.DA = iph->daddr;	/* Already in network byte order */
+	frame.SA = iph->saddr;	/* Already in network byte order */
+	frame.Fb = htonl(qntz_Fb);
+	frame.qoff = htonl(q->Q_EQ - q->qlen);
+	frame.qdelta = htonl(q->qlen - q->qlen_old);
+
+	/* Connecting and sending the packet */
+	q->addr.sin_port = htons(LISTEN_PORT);
+	q->addr.sin_addr.s_addr = iph->saddr & htonl(0xFFFF00FF);
+	/* The "AND 0xFFFF00FF" is a "workaround" to send the packet
+	   to the physical machine's IP instead of the virtual
+	   machine's IP (which was sampled). This code assumes that
+	   the VMs' IP addresses are assigned in such a way that each
+	   VM is placed on a PM which has an IP address equals to the
+	   VM IP address with the bits from 8 to 15 set to 0 (hence
+	   the AND 0xFFFF00FF). Such "workaround" is needed because we
+	   dont have a host directory that maps VMs->PMs within the
+	   kernel. */
+	if (q->sock->ops->connect(sock, (struct sockaddr *) addr,
+							  sizeof(struct sockaddr), 0) < 0) {
+		printk(KERN_WARNING "Could not connect to 0x%x qntz_Fb", 
+			   q->addr.sin_addr.s_addr);
+	} else {
+		if (sock->sk == NULL)
+			return 0;
+		
+		iov.iov_base = frame;
+		iov.iov_len = sizeof(struct qcn_frame);
+		
+		msg.msg_name = addr;
+		msg.msg_namelen  = sizeof(struct sockaddr_in);
+		msg.msg_control = NULL;
+		msg.msg_controllen = 0;
+		msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		msg.msg_control = NULL;
+		msg.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL;
+
+		oldfs = get_fs();
+		set_fs(KERNEL_DS);
+		size = sock_sendmsg(sock, &msg, sizeof(struct qcn_frame));
+		set_fs(oldfs);
+	}
+
+	return size;
+}
+
 static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
@@ -147,65 +211,105 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 
 	int Fb;
 	u32 qntz_Fb, generate_fb_frame;
-	struct qcn_frame frame;
 
 	if (len > q->max_size)
 		return qdisc_reshape_fail(skb, sch);
+
+	/* QCN Algorithm */
+	if (!q->sending_fb) {
+		q->qlen += len;
+
+		Fb = (q->Q_EQ - q->qlen) - q->W * (q->qlen - q->qlen_old);
+		if (Fb < -q->Q_EQ * (2 * q->W +1)) {
+			Fb = -q->Q_EQ * (2 * q->W +1);
+		}
+		else if (Fb > 0)
+			Fb = 0;
+
+		/* The maximum value of -Fb determines the number of bits that Fb
+		   uses. Uniform quantization of -Fb, qntz_Fb, uses most
+		   significant bits of -Fb. Note that now qntz_Fb has positive
+		   values.  If Q_EQ = 32KB, W = 2, qlen = 160KB then the maximum
+		   value for -Fb is 457728, which can be represented using 19bits
+		   (110 1111 1100 0000 0000). To get the 6 most significant bits
+		   --- considering that -Fb will use at most 19 bits ---, we need
+		   to discard the 13 least significant bits (>> 13).
+		*/
+		qntz_Fb = ((u32) -Fb) >> 13;
+
+		generate_fb_frame = 0;
+		q->sample -= len;
+		if (q->sample < 0) {
+			if (qntz_Fb > 0) {
+				generate_fb_frame = 1;
+				printk(KERN_WARNING "Generate feedback, Fb 0x%x, qntz_Fb 0x%x",
+					   Fb, qntz_Fb);
+			}
+			q->qlen_old = q->qlen;
+			/* TODO: random sampling */
+			q->sample = 153600;
+		}
+
+		if (generate_fb_frame && skb && skb->network_header &&
+			(skb->protocol == __constant_htons(ETH_P_IP))) {
+
+			qcn_send_fb();
+
+
+			/* Since we are using IP addresses, we need to sample only IP
+			 * packets. */
+		
+			printk(KERN_WARNING "Sending Fb...");
+		
+			/* Filling the structure */
+			memset(&frame, 0, sizeof(struct qcn_frame));
+			iph = ip_hdr(skb);
+			frame.DA = iph->daddr;	/* Already in network byte order */
+			frame.SA = iph->saddr;	/* Already in network byte order */
+			frame.Fb = htonl(qntz_Fb);
+			frame.qoff = htonl(q->Q_EQ - q->qlen);
+			frame.qdelta = htonl(q->qlen - q->qlen_old);
+		
+			/* Connecting and sending the packet */
+			q->addr.sin_port = htons(LISTEN_PORT);
+			q->addr.sin_addr.s_addr = iph->saddr & htonl(0xFFFF00FF);
+		
+			/* The "AND 0xFFFF00FF" is a "workaround" to send the packet
+			   to the physical machine's IP instead of the virtual
+			   machine's IP (which was sampled). This code assumes that
+			   the VMs' IP addresses are assigned in such a way that each
+			   VM is placed on a PM which has an IP address equals to the
+			   VM IP address with the bits from 8 to 15 set to 0 (hence
+			   the AND 0xFFFF00FF). Such "workaround" is needed because we
+			   dont have a host directory that maps VMs->PMs within the
+			   kernel. */
+			if (q->sock->ops->connect(q->sock, (struct sockaddr *) &q->addr,
+									  sizeof(struct sockaddr), 0) < 0) {
+				printk(KERN_WARNING "Could not connect to 0x%x qntz_Fb", 
+					   q->addr.sin_addr.s_addr);
+			} else {
+				q->sending_fb = 1; 	/* Avoiding infinite loop */
+				if ((ret = qcn_send_fb(q->sock, &q->addr,
+									   (unsigned char *) &frame)) > 0) {
+					printk(KERN_INFO
+						   "qntz_Fb of 0x%x was sent to PM address 0x%x",
+						   qntz_Fb, q->addr.sin_addr.s_addr); 
+					q->sending_fb = 0;
+				} else { 
+					/* printk(KERN_WARNING "Connected to IP 0x%x port 0x%x.",  */
+					/* 	   q->addr.sin_addr.s_addr, q->addr.sin_port); */
+					printk(KERN_WARNING "Could not send qntz_Fb! ret = %d", ret);
+				}
+			}
+		}
+	}
+	/* End QCN Algorithm */
 
 	ret = qdisc_enqueue(skb, q->qdisc);
 	if (ret != 0) {
 		if (net_xmit_drop_count(ret))
 			sch->qstats.drops++;
 		return ret;
-	}
-
-	/* QCN Algorithm */
-	q->qlen += len;
-	Fb = (q->Q_EQ - q->qlen) - q->W * (q->qlen - q->qlen_old);
-	if (Fb < -q->Q_EQ * (2 * q->W +1)) {
-		Fb = -q->Q_EQ * (2 * q->W +1);
-	}
-	else if (Fb > 0)
-		Fb = 0;
-
-	/* The maximum value of -Fb determines the number of bits that Fb
-	   uses. Uniform quantization of -Fb, qntz_Fb, uses most
-	   significant bits of -Fb. Note that now qntz_Fb has positive
-	   values.  */
-	qntz_Fb = ((u32) -Fb) >> 13;
-
-	generate_fb_frame = 0;
-	q->sample -= len;
-	if (q->sample < 0) {
-		if (qntz_Fb > 0) {
-			generate_fb_frame = 1;
-			printk(KERN_WARNING "generate feedback, Fb %x, qntz_Fb %x",
-				   Fb, qntz_Fb);
-		}
-		q->qlen_old = q->qlen;
-		/* TODO */
-		q->sample = 150000;
-	}
-
-	if (generate_fb_frame) {
-		printk(KERN_WARNING "Sending Fb...");
-		
-		struct iphdr *iph = ip_hdr(skb);
-
-		/* Filling the structure */
-		frame.DA = iph->daddr;
-		frame.SA = iph->saddr;
-		frame.Fb = qntz_Fb;
-		frame.qoff = q->Q_EQ - q->qlen;
-		frame.qdelta = q->qlen - q->qlen_old;
-		
-		/* Connecting and sending the packet */
-		q->addr.sin_addr.s_addr = iph->saddr & 0xFFFF00FF;
-		q->addr.sin_addr.sin_port = htons(LISTEN_PORT);
-		if (q->sock->ops->connect(q->sock, (struct sockaddr *)
-								  &q->addr, sizeof(struct sockaddr), 0) < 0) {
-			
-		}
 	}
 
 	sch->q.qlen++;
@@ -398,18 +502,19 @@ static int tbf_init(struct Qdisc* sch, struct nlattr *opt)
 	q->qdisc = &noop_qdisc;
 
 	/* QCN Parameters */
-	printk(KERN_WARNING "Initializing QCN parameters");
+	printk(KERN_WARNING "Initializing QCN CP parameters");
 	q->Q_EQ = 33792; 			/* 33KB */
 	q->W = 2;
 
 	/* Initializing variables */
 	q->qlen = 0;
 	q->qlen_old = 0;
-	q->sample = 150000;
+	q->sample = 153600;
 
 	/* Creating a socket to send udp messages */
 	if (sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &q->sock) < 0) {
-		printk(KERN_INFO "Could not create a datagram socket, error = %d\n", -ENXIO);
+		printk(KERN_INFO "Could not create the send socket, error = %d\n",
+			   -ENXIO);
 	}
 
 	return tbf_change(sch, opt);

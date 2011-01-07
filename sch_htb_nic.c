@@ -40,6 +40,10 @@
 #include <net/netlink.h>
 #include <net/pkt_sched.h>
 
+#include <linux/kthread.h>
+#include <linux/ip.h>
+#define LISTEN_PORT 6660
+
 /* HTB algorithm.
     Author: devik@cdi.cz
     ========================================================================
@@ -125,7 +129,7 @@ struct htb_class {
 	psched_time_t t_c;	/* checkpoint time */
 	psched_time_t t_p; 	/* time - 1sec */
 
-	/* QCN variables */
+	/* QCN Variables */
 	__u32 qcn_TR;
 	__u32 qcn_CR;
 	__u32 qcn_byte_ctr;
@@ -133,12 +137,26 @@ struct htb_class {
 	__u16 qcn_timer_state;
 	psched_time_t qcn_timer;
 
-	/* QCN parameters */
-	__u32 qcn_AI_INC;
-	__u32 qcn_HAI_INC;
-	__u32 qcn_GD;
-	__u32 qcn_MIN_RATE;
-	__u32 qcn_C;
+	/* QCN Parameters */
+	psched_time_t qcn_TIMER;	/* Timer time-out threshold */
+	__u32 qcn_FASTREC;			/* Fast recovery threshold */
+	__u32 qcn_BC;				/* Byte counter time-out */
+	__u32 qcn_AI_INC;			/* Rate increase in the AI stage */
+	__u32 qcn_HAI_INC;			/* Rate increase in the HAI stage */
+	__u32 qcn_GD;				/* Control gain parameter */
+	__u32 qcn_MIN_RATE;			/* Minimum rate of a rate limiter */
+	__u32 qcn_MIN_RATE_DEC;		/* Minimum rate descrease factor */
+	__u32 qcn_C;				/* Link speed */
+	
+};
+
+struct kthread_t
+{
+	struct task_struct *thread;
+	struct socket *sock;
+	struct sockaddr_in addr;
+	struct Qdisc *sch;
+	int running;
 };
 
 struct htb_sched {
@@ -175,6 +193,28 @@ struct htb_sched {
 #define HTB_WARN_TOOMANYEVENTS	0x1
 	unsigned int warned;	/* only one warning */
 	struct work_struct work;
+
+	/* QCN Parameters */
+	psched_time_t qcn_TIMER;	/* Timer time-out threshold */
+	__u32 qcn_FASTREC;			/* Fast recovery threshold */
+	__u32 qcn_BC;				/* Byte counter time-out */
+	__u32 qcn_AI_INC;			/* Rate increase in the AI stage */
+	__u32 qcn_HAI_INC;			/* Rate increase in the HAI stage */
+	__u32 qcn_GD;				/* Control gain parameter */
+	__u32 qcn_MIN_RATE;			/* Minimum rate of a rate limiter */
+	__u32 qcn_MIN_RATE_DEC;		/* Minimum rate descrease factor */
+	__u32 qcn_C;				/* Link speed */
+
+	/* Feedback Controller thread */
+	struct kthread_t *t;
+};
+
+struct qcn_frame {
+	u32 DA;
+	u32 SA;
+	u32 Fb;
+	u32 qoff;
+	u32 qdelta;
 };
 
 /* find class in global hash table using given handle */
@@ -738,6 +778,24 @@ static struct rb_node *htb_id_find_next_upper(int prio, struct rb_node *n,
 	return r;
 }
 
+static void qcn_feedback_controller(struct htb_sched *q)
+{
+	int err;
+	/* Creating a socket to recv udp messages */
+	if (sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &q->t->sock) < 0) {
+		printk(KERN_INFO "Could not create the recv socket, error = %d\n",
+			   -ENXIO);
+	}
+
+	q->t->addr.sin_port = htons(LISTEN_PORT);
+	q->t->addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	if ((err = q->t->sock->ops->bind(q->t->sock, (struct sockaddr *)&q->t->addr,
+									 sizeof(struct sockaddr))) < 0) {
+		printk(KERN_INFO "Could not bind the recv socket, error = %d\n",
+			   err);
+	}
+}
+
 /**
  * htb_lookup_leaf - returns next leaf class in DRR order
  *
@@ -1039,6 +1097,32 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 		q->rate2quantum = 1;
 	q->defcls = gopt->defcls;
 
+	/* QCN Parameters */
+	printk(KERN_WARNING "Initializing QCN RP parameters");
+
+	q->qcn_TIMER = 25;
+	q->qcn_FASTREC = 5;
+	q->qcn_BC = 153600;
+	q->qcn_AI_INC = 524288;
+	q->qcn_HAI_INC = 5242880;
+	q->qcn_GD = 7; 				/* = 1/128 */
+	q->qcn_MIN_RATE = 524288;
+	q->qcn_MIN_RATE_DEC = 2;	/* = 1/2 */
+	q->qcn_C = 125000000;		/* bytes/sec = 1Gbit*/
+
+
+	/* Creating the Feedback Controller thread */
+	q->t = kmalloc(sizeof(struct kthread_t), GFP_KERNEL);
+	memset(q->t, 0, sizeof(struct kthread_t));
+	q->t->thread = kthread_run((void *)qcn_feedback_controller,
+							   q, "QCN Feedback Controller");
+	if (IS_ERR(q->t->thread))
+	{
+		printk(KERN_WARNING "Unable to start kernel thread\n");
+		kfree(q->t);
+		q->t = NULL;
+	}
+
 	return 0;
 }
 
@@ -1122,7 +1206,7 @@ htb_dump_class_stats(struct Qdisc *sch, unsigned long arg, struct gnet_dump *d)
 	cl->xstats.ctokens = cl->ctokens;
 
 	if (gnet_stats_copy_basic(d, &cl->bstats) < 0 ||
-	    gnet_stats_copy_rate_est(d, NULL, &cl->rate_est) < 0 ||
+	    gnet_stats_copy_rate_est(d, &cl->rate_est) < 0 ||
 	    gnet_stats_copy_queue(d, &cl->qstats) < 0)
 		return -1;
 
