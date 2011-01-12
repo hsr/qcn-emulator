@@ -42,7 +42,6 @@
 
 #include <linux/kthread.h>
 #include <linux/ip.h>
-#include <linux/sched.h>
 #include <linux/wait.h>
 
 #define LISTEN_PORT 6660
@@ -156,8 +155,8 @@ struct htb_class {
 
 struct qcn_kthread_t {
 	struct task_struct *tsk;
-	struct socket *sock;		/* Socket to recv Fb */
 	struct sockaddr_in addr;
+	struct socket *sock;		/* Socket to recv Fb */
 	struct Qdisc *sch;			/* The scheduler itself */
 	/* Do we need to wait for thread's completion? */
 	/* struct completion; */
@@ -814,7 +813,6 @@ static int qcn_feedback_controller(void *arg)
 		goto out;
 	}
 
-	set_current_state(TASK_INTERRUPTIBLE);
 	while (!kthread_should_stop()) {
 
 		memset(&frame, 0, sizeof(struct qcn_frame));
@@ -824,20 +822,12 @@ static int qcn_feedback_controller(void *arg)
 		/* size = qcn_recv_fb(q->th->sock, &q->th->addr, frame, */
 		/* 				   sizeof(struct qcn_frame)); */
 
-		set_current_state(TASK_RUNNING);
-
-		if (signal_pending(current))
-			break;
-
 		if (size < 0)
 			printk(KERN_EMERG "Error %d while recving Fb\n", size);
-		else 
-		{
+		else {
 			/* htb_find(); */
 			printk(KERN_EMERG "Received %d bytes\n", size);
 		}
-
-		set_current_state(TASK_INTERRUPTIBLE);
 
 	}
 
@@ -1113,8 +1103,6 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 	int err;
 	int i;
 
-	struct task_struct *p;
-
 	if (!opt)
 		return -EINVAL;
 
@@ -1170,14 +1158,13 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 	memset(&q->th, 0, sizeof(struct qcn_kthread_t));
 	q->th.tsk = NULL;
 	q->th.sock = NULL;
-	p = kthread_create(qcn_feedback_controller, sch,
+	q->th.tsk = kthread_create(qcn_feedback_controller, sch,
 					   THREAD_NAME);
-	if (IS_ERR(p)) {
+	if (IS_ERR(q->th.tsk)) {
 		printk(KERN_EMERG "Unable to start QCN Feedback Controller\n");
-		kfree(p);
+		kfree(q->th.tsk);
 	}
-	q->th.tsk = p;
-	wake_up_process(p);
+	wake_up_process(q->th.tsk);
 
 	return 0;
 }
