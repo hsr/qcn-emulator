@@ -156,13 +156,13 @@ struct htb_class {
 	
 };
 
-struct kthread_t
-{
-	struct task_struct *thread;
-	struct socket *sock;
+struct qcn_kthread_t {
+	struct task_struct *tsk;
+	struct socket *sock;		/* Socket to recv Fb */
 	struct sockaddr_in addr;
-	struct Qdisc *q;
-	int running;
+	struct Qdisc *sch;			/* The scheduler itself */
+	/* Do we need to wait for thread's completion? */
+	/* struct completion; */
 };
 
 struct htb_sched {
@@ -212,7 +212,7 @@ struct htb_sched {
 	__u32 qcn_C;				/* Link speed */
 
 	/* Feedback Controller thread */
-	struct kthread_t *t;
+	struct qcn_kthread_t t;
 };
 
 struct qcn_frame {
@@ -784,37 +784,30 @@ static struct rb_node *htb_id_find_next_upper(int prio, struct rb_node *n,
 	return r;
 }
 
-static void qcn_feedback_controller(struct htb_sched *q)
+/* Feedback Controller Thread */
+static void qcn_feedback_controller(void *arg)
 {
-	int err, size;
+	struct Qdisc *sch = arg;
+	struct htb_sched *q = qdisc_priv(sch);
+	struct qcn_kthread_t *t = &q->t;
 	struct qcn_frame frame;
+	int err, size;
 	
-    /* Kernel thread initialization */
-	lock_kernel();
-	q->t->running = 1;
-	current->flags |= PF_NOFREEZE;
-	
-    /* Daemonize (take care with signals, after daemonize() they are
-	   disabled) */
-	daemonize("QCN Feedback Controller");
-	allow_signal(SIGKILL);
-	unlock_kernel();
-
-	printk(KERN_EMERG "Kernel thread was created");
+	printk(KERN_EMERG "QCN Feedback Controller was created successfully!");
 
 	/* Creating a socket to recv udp messages */
-	if (sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &q->t->sock) < 0) {
+	if (sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &t->sock) < 0) {
 		printk(KERN_EMERG "Could not create the recv socket, error = %d\n",
 			   -ENXIO);
 		goto out;
 	}
 
-	memset(&q->t->addr, 0, sizeof(struct sockaddr));
-	q->t->addr.sin_family = AF_INET;
-	q->t->addr.sin_port = htons(LISTEN_PORT);
-	q->t->addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	if ((err = q->t->sock->ops->bind(q->t->sock, (struct sockaddr *)&q->t->addr,
-									 sizeof(struct sockaddr))) < 0) {
+	memset(&t->addr, 0, sizeof(struct sockaddr));
+	t->addr.sin_family = AF_INET;
+	t->addr.sin_port = htons(LISTEN_PORT);
+	t->addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	if ((err = t->sock->ops->bind(t->sock, (struct sockaddr *)&t->addr,
+								  sizeof(struct sockaddr))) < 0) {
 		printk(KERN_EMERG "Could not bind the recv socket, error = %d\n",
 			   err);
 		goto close_and_out;
@@ -826,6 +819,7 @@ static void qcn_feedback_controller(struct htb_sched *q)
 		size = 0;
 		/* size = qcn_recv_fb(q->t->sock, &q->t->addr, frame, */
 		/* 				   sizeof(struct qcn_frame)); */
+		htb_find();
 
 		if (signal_pending(current))
 			break;
@@ -844,7 +838,7 @@ close_and_out:
 	q->t->sock = NULL;
 
 out:
-	q->t->thread = NULL;
+	q->t->tsk = NULL;
 	q->t->running = 0;
 
 }
@@ -1113,6 +1107,8 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 	int err;
 	int i;
 
+	struct task_struct *p;
+
 	if (!opt)
 		return -EINVAL;
 
@@ -1153,6 +1149,7 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 	/* QCN Parameters */
 	printk(KERN_EMERG "Initializing QCN RP parameters");
 
+	/* Rates are always in bytes/sec  */
 	q->qcn_TIMER = 25;
 	q->qcn_FASTREC = 5;
 	q->qcn_BC = 153600;
@@ -1161,23 +1158,21 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 	q->qcn_GD = 7; 				/* = 1/128 */
 	q->qcn_MIN_RATE = 524288;
 	q->qcn_MIN_RATE_DEC = 2;	/* = 1/2 */
-	q->qcn_C = 125000000;		/* bytes/sec = 1Gbit*/
+	q->qcn_C = 125000000;		/* = 1Gbit*/
 
 
 	/* Creating the Feedback Controller thread */
-	q->t = NULL;
-	q->t = kmalloc(sizeof(struct kthread_t), GFP_KERNEL);
-	memset(q->t, 0, sizeof(struct kthread_t));
-	q->t->sock = NULL; 
-	/* q->t->thread = kthread_run((void *)qcn_feedback_controller, */
-	/* 						   q, "QCN Feedback Controller"); */
-	if (IS_ERR(q->t->thread))
+	
+	memset(&q->t, 0, sizeof(struct qcn_kthread_t));
+	q->t.sock = NULL;
+	p = kthread_create(qcn_feedback_controller, sch,
+					   "QCN Feedback Controller");
+	if (IS_ERR(p))
 	{
-		printk(KERN_EMERG "Unable to start kernel thread\n");
-		kfree(q->t);
-		q->t = NULL;
+		printk(KERN_EMERG "Unable to start QCN Feedback Controller\n");
+		kfree(p);
 	}
-	kfree(q->t);
+	
 
 	return 0;
 }
@@ -1370,11 +1365,11 @@ static void htb_destroy(struct Qdisc *sch)
 
 	/* Destroying the Feedback Controller thread and releasing its
 	   socket */
-	if (q->t->thread == NULL) {
+	if (q->t->tsk == NULL) {
 		printk(KERN_EMERG "No kernel thread to kill\n");
 	} else {
 		lock_kernel();
-		err = kill_pid(task_pid(q->t->thread), SIGKILL, 1);
+		err = kill_pid(task_pid(q->t->tsk), SIGKILL, 1);
 		unlock_kernel();
 		
 		/* Wait for kernel thread to die */
