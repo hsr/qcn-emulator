@@ -133,12 +133,13 @@ struct htb_class {
 	psched_time_t t_p; 	/* time - 1sec */
 
 	/* QCN Variables */
-	/* __u32 qcn_TR; */
-	/* __u32 qcn_CR; */
-	/* __u32 qcn_byte_ctr; */
-	/* __u16 qcn_byte_state; */
-	/* __u16 qcn_timer_state; */
-	/* psched_time_t qcn_timer; */
+	__u32 qcn_TR;
+	__u32 qcn_CR;
+	__u32 qcn_byte_ctr;
+	__u16 qcn_byte_state;
+	__u16 qcn_timer_state;
+	psched_time_t qcn_timer;
+	spinlock_t R_lock;
 
 	/* QCN Parameters */
 	psched_time_t qcn_TIMER;	/* Timer time-out threshold */
@@ -150,7 +151,6 @@ struct htb_class {
 	__u32 qcn_MIN_RATE;			/* Minimum rate of a rate limiter */
 	__u32 qcn_MIN_RATE_DEC;		/* Minimum rate descrease factor */
 	__u32 qcn_C;				/* Link speed */
-	
 };
 
 struct qcn_kthread_t {
@@ -219,6 +219,11 @@ struct qcn_frame {
 	u32 qoff;
 	u32 qdelta;
 };
+
+/* parameters are ip address in network byte order (big endian) */
+static inline u32 handle_from_ip(u32 src_be, u32 dst_be) {
+	return ((0x000000FF & ntohl(src_be)) << 8) & (0x000000FF & ntohl(dst_be));
+}
 
 /* find class in global hash table using given handle */
 static inline struct htb_class *htb_find(u32 handle, struct Qdisc *sch)
@@ -1569,6 +1574,9 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 		cl->mbuffer = 60 * PSCHED_TICKS_PER_SEC;	/* 1min */
 		cl->t_c = psched_get_time();
 		cl->cmode = HTB_CAN_SEND;
+
+		/* QCN Parameters */
+		
 
 		/* attach to the hash list and parent's family */
 		qdisc_class_hash_insert(&q->clhash, &cl->common);
