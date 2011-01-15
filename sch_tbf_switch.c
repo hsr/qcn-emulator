@@ -275,6 +275,20 @@ out:
 	return 0;
 }
 
+static inline int mark_table(u32 qntz_Fb) {
+	switch (qntz_Fb >> 3) {
+	case 0: return 153600;
+	case 1:	return 76800;
+	case 2:	return 51200;
+	case 3:	return 38400;
+	case 4:	return 30720;
+	case 5: return 25600;
+	case 6: return 22016;
+	case 7: return 18944;
+	}
+	return 153600;
+}
+
 static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
@@ -320,7 +334,7 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 		}
 		q->qlen_old = q->qlen;
 		/* TODO: random sampling */
-		q->sample = 153600;
+		q->sample = mark_table(qntz_Fb);
 	}
 	
 	if (generate_fb_frame && skb && skb->network_header &&
