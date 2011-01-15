@@ -27,10 +27,12 @@
 #include <linux/kthread.h>
 #include <linux/wait.h>
 #include <linux/kfifo.h>
-#include <linux/mutex.h>
-#define LISTEN_PORT 6660
-#define THREAD_NAME "QCNFbSender%x"
-#define FRAME_FIFO_SIZE 32
+
+#define LISTEN_PORT             6660
+#define THREAD_NAME             "QCNFbSender%x"
+#define FRAME_KFIFO_SIZE        32
+#define QCN_Q_EQ                33792 /* 33KB */
+#define QCN_W                   2
 
 /*	Simple Token Bucket Filter.
 	=======================================
@@ -111,8 +113,8 @@ struct qcn_frame {
 	u32 DA;
 	u32 SA;
 	u32 Fb;
-	u32 qoff;
-	u32 qdelta;
+	int qoff;
+	int qdelta;
 };
 
 /* struct qcn_frame_list { */
@@ -206,10 +208,8 @@ static int qcn_send_fb (struct socket *sock, struct sockaddr_in *addr,
 	printk(KERN_EMERG "Connected to 0x%x qntz_Fb 0x%x", 
 		   addr->sin_addr.s_addr, frame->Fb);
 
-	if (sock->sk == NULL) {
-		printk(KERN_EMERG "sk is null!");
+	if (sock->sk == NULL) 
 		return 0;
-	}
 		
 	iov.iov_base = frame;
 	iov.iov_len = sizeof(struct qcn_frame);
@@ -237,9 +237,6 @@ int qcn_feedback_sender(void *arg) {
 	struct qcn_kthread_t *th = &q->th;
 	struct qcn_frame frame;
 
-	/* Testing */
-	/* DECLARE_WAIT_QUEUE_HEAD(my_queue); */
-
 	printk(KERN_EMERG "%s: success!\n", th->tsk->comm);
 	
 	/* Creating a socket to recv udp messages */
@@ -252,7 +249,6 @@ int qcn_feedback_sender(void *arg) {
 	}
 
 	while (!kthread_should_stop()) {
-		/* wait_event_interruptible_timeout(my_queue, 0, HZ); */
 		if (down_timeout(&th->sem_frame_fifo, HZ) == 0) {
 			printk(KERN_EMERG "%s: acquired the lock!", th->tsk->comm);
 
@@ -266,7 +262,6 @@ int qcn_feedback_sender(void *arg) {
 				printk(KERN_EMERG "%s: fb sent to %x",
 					   th->tsk->comm, frame.SA);
 
-			/* up(&th->sem_frame_fifo); */
 		} else {
 			/* printk(KERN_EMERG "%s: down_timeout!", th->tsk->comm); */
 		}
@@ -276,7 +271,7 @@ out:
 	printk(KERN_EMERG "%s: releasing socket\n", th->tsk->comm);
 	sock_release(th->sock);
 	th->sock = NULL;
-
+	th->tsk = NULL;
 	return 0;
 }
 
@@ -297,9 +292,9 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 	/* QCN Algorithm */
 	q->qlen += len;
 	
-	Fb = (q->Q_EQ - q->qlen) - q->W * (q->qlen - q->qlen_old);
-	if (Fb < -q->Q_EQ * (2 * q->W +1)) {
-		Fb = -q->Q_EQ * (2 * q->W +1);
+	Fb = (QCN_Q_EQ - q->qlen) - QCN_W * (q->qlen - q->qlen_old);
+	if (Fb < -QCN_Q_EQ * (2 * QCN_W +1)) {
+		Fb = -QCN_Q_EQ * (2 * QCN_W +1);
 	}
 	else if (Fb > 0)
 		Fb = 0;
@@ -341,7 +336,7 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 		frame.DA = iph->daddr;	/* Already in network byte order */
 		frame.SA = iph->saddr;	/* Already in network byte order */
 		frame.Fb = htonl(qntz_Fb);
-		frame.qoff = htonl(q->Q_EQ - q->qlen);
+		frame.qoff = htonl(QCN_Q_EQ - q->qlen);
 		frame.qdelta = htonl(q->qlen - q->qlen_old);
 
 		if (!kfifo_put(&q->th.frame_fifo, &frame))
@@ -349,13 +344,6 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 		else
 			up(&q->th.sem_frame_fifo);
 
-		/* q->sending_fb = 1; 	/\* Avoiding infinite loop -- doesnt work*\/ */
-		/* if ((ret = qcn_send_fb(q->sock, &q->addr, &frame, frame.SA)) > 0) { */
-		/* 	printk(KERN_EMERG "qntz_Fb of 0x%x was sent to PM address 0x%x", */
-		/* 		   qntz_Fb, q->addr.sin_addr.s_addr); */
-		/* } else { */
-		/* 	printk(KERN_EMERG "Could not send qntz_Fb! ret = %d", ret); */
-		/* } */
 	}
 	/* End QCN Algorithm */
 
@@ -422,7 +410,7 @@ static struct sk_buff *tbf_dequeue(struct Qdisc* sch)
 			sch->q.qlen--;
 			sch->flags &= ~TCQ_F_THROTTLED;
 
-			/* QCN Variables */
+			/* QCN: Update the queue len */
 			q->qlen -= len;
 
 			return skb;
@@ -556,9 +544,7 @@ static int tbf_init(struct Qdisc* sch, struct nlattr *opt)
 	q->qdisc = &noop_qdisc;
 
 	/* QCN Parameters */
-	printk(KERN_EMERG "Initializing QCN CP parameters");
-	q->Q_EQ = 33792; 			/* 33KB */
-	q->W = 2;
+	printk(KERN_EMERG "Initializing QCN CP Variables");
 
 	/* Initializing variables */
 	q->qlen = 0;
@@ -569,10 +555,10 @@ static int tbf_init(struct Qdisc* sch, struct nlattr *opt)
 	memset(&q->th, 0, sizeof(struct qcn_kthread_t));
 	q->th.tsk = NULL;
 	q->th.sock = NULL;
-	/* Thread's fifo queue for qcn frames */
+	/* Thread's fifo queue, for qcn frames */
 	sema_init(&q->th.sem_frame_fifo, 0);
 	q->th.frame_fifo_alloc = 0;
-	if (kfifo_alloc(&q->th.frame_fifo, FRAME_FIFO_SIZE, GFP_KERNEL)) {
+	if (kfifo_alloc(&q->th.frame_fifo, FRAME_KFIFO_SIZE, GFP_KERNEL)) {
 		printk(KERN_EMERG "error kfifo_alloc\n");
 		q->th.frame_fifo_alloc = 1;
 	}
@@ -582,8 +568,10 @@ static int tbf_init(struct Qdisc* sch, struct nlattr *opt)
 	if (IS_ERR(q->th.tsk)) {
 		printk(KERN_EMERG "Unable to start the Feedback Sender Thread\n");
 		kfree(q->th.tsk);
+		q->th.tsk = NULL;
+	} else {
+		wake_up_process(q->th.tsk);
 	}
-	wake_up_process(q->th.tsk);
 
 	return tbf_change(sch, opt);
 }

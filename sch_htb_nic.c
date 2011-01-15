@@ -50,7 +50,7 @@
 #define THREAD_NAME        "QCNFbController"
 #define LISTEN_PORT        6660
 
-/* QCN Parameters */
+/* QCN Parameters (rates are always bytes/sec */
 #define QCN_TIMER          25*PSCHED_TICKS_PER_SEC/1000
 #define QCN_FASTREC        5
 #define QCN_BC             153600	 /* 150KB */
@@ -58,7 +58,7 @@
 #define QCN_HAI            5242880	 /* 5MB */
 #define QCN_GD             7		 /* 1/128 */
 #define QCN_MIN_RATE       524288	 /* 0.5MB */
-#define QCN_MIN_RATE_DEC   2		 /* = 1/2 */
+#define QCN_MIN_RATE_DEC   1		 /* = 1/2 */
 #define QCN_C              125000000 /* 1GB */
 
 /* HTB algorithm.
@@ -154,16 +154,6 @@ struct htb_class {
 	psched_time_t timer;	/* Timer */
 	__u16 timer_stg;		/* Timer stage */
 
-	/* QCN Parameters */
-	/* psched_time_t qcn_TIMER;	/\* Timer time-out threshold *\/ */
-	/* __u32 qcn_FASTREC;			/\* Fast recovery threshold *\/ */
-	/* __u32 qcn_BC;				/\* Byte counter threshold *\/ */
-	/* __u32 qcn_AI_INC;			/\* Rate increase in the AI stage *\/ */
-	/* __u32 qcn_HAI_INC;			/\* Rate increase in the HAI stage *\/ */
-	/* __u32 qcn_GD;				/\* Control gain parameter *\/ */
-	/* __u32 qcn_MIN_RATE;			/\* Minimum rate of a rate limiter *\/ */
-	/* __u32 qcn_MIN_RATE_DEC;		/\* Minimum rate descrease factor *\/ */
-	/* __u32 qcn_C;				/\* Link speed *\/ */
 };
 
 struct qcn_kthread_t {
@@ -208,22 +198,10 @@ struct htb_sched {
 	unsigned int warned;	/* only one warning */
 	struct work_struct work;
 
-	/* QCN Parameters */
-	/* psched_time_t qcn_TIMER;	/\* Timer time-out threshold *\/ */
-	/* __u32 qcn_FASTREC;			/\* Fast recovery threshold *\/ */
-	/* __u32 qcn_BC;				/\* Byte counter time-out *\/ */
-	/* __u32 qcn_AI_INC;			/\* Rate increase in the AI stage *\/ */
-	/* __u32 qcn_HAI_INC;			/\* Rate increase in the HAI stage *\/ */
-	/* __u32 qcn_GD;				/\* Control gain parameter *\/ */
-	/* __u32 qcn_MIN_RATE;			/\* Minimum rate of a rate limiter *\/ */
-	/* __u32 qcn_MIN_RATE_DEC;		/\* Minimum rate descrease factor *\/ */
-	/* __u32 qcn_C;				/\* Link speed *\/ */
-
 	/* HTB uses a lookup table (rtable) to translate packet sizes to 
 	   # of tokens. However, this table is built in userspace. Therefore,
 	   when executing the QCN's Reaction Point algorithm, we ignore the rtable
-	   and translate pkt size to tokens by hand using the following variable.
-	*/
+	   and translate pkt size to tokens by hand using the following variable. */
 	__u32 clock_factor;
 
 	/* Feedback Controller thread */
@@ -234,13 +212,16 @@ struct qcn_frame {
 	u32 DA;
 	u32 SA;
 	u32 Fb;
-	u32 qoff;
-	u32 qdelta;
+	int qoff;
+	int qdelta;
 };
 
-/* parameters are ip address in network byte order (big endian) */
-static inline u32 handle_from_ip(u32 src_be, u32 dst_be) {
-	return ((0x000000FF & ntohl(src_be)) << 8) & (0x000000FF & ntohl(dst_be));
+/* Get qdisc handle from ip: parameters are 2 ip addresses in network
+   byte order (big endian) */
+static inline u32 gethandle(u32 src_be, u32 dst_be) {
+	u32 major = 0x00010000;
+	u32 minor = ((0x000000FF & ntohl(src_be))<<8) & (0x000000FF & ntohl(dst_be));
+	return major | minor;
 }
 
 /* find class in global hash table using given handle */
@@ -664,27 +645,26 @@ static int htb_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 }
 
 static inline void qcn_self_increase (struct htb_class *cl) {
-	__u32 Ri;
+	u32 rate_increase;
 
-	/* self increase */
 	if (cl->bcount_stg > QCN_FASTREC ||
 		cl->timer_stg > QCN_FASTREC) {
 		if (cl->bcount_stg > QCN_FASTREC &&
 				cl->timer_stg > QCN_FASTREC)
 			/* Hyperactive increase */
-			Ri = QCN_HAI;
+			rate_increase = QCN_HAI;
 		else
-			Ri = QCN_AI;
+			rate_increase = QCN_AI;
 	}
 	else
-		Ri = 0;
+		rate_increase = 0;
 	
 	/* At the end of the first cycle of recovery */
 	if ((cl->bcount_stg == 1 || cl->timer_stg == 1) &&
 		cl->trate > 10 * cl->crate)
 		cl->trate = cl->trate >> 3;
 	else
-		cl->trate += Ri;
+		cl->trate += rate_increase;
 	
 	cl->crate = (cl->trate + cl->crate) >> 1;
 }
@@ -713,9 +693,9 @@ static inline void htb_accnt_tokens(struct htb_class *cl, int bytes,
 			cl->timer_stg++;
 			qcn_self_increase(cl);
 			if (cl->timer_stg < QCN_FASTREC)
-				cl->timer = now + QCN_FASTREC; /* TODO: "Randomize" */
+				cl->timer = now + QCN_TIMER; /* TODO: "Randomize" */
 			else
-				cl->timer = now + (QCN_FASTREC >> 1);
+				cl->timer = now + (QCN_TIMER >> 1);
 		}
 		
 		/* Updating byte counter */
@@ -881,10 +861,8 @@ static inline int qcn_recv_fb(struct socket* sock, struct sockaddr_in* addr,
 	mm_segment_t oldfs;
 	int size = 0;
 
-	if (sock->sk == NULL) {
-		printk(KERN_EMERG "Null sk pointer? What are you trying to do?");
+	if (sock->sk == NULL) 
 		return 0;
-	}
 
 	iov.iov_base = buf;
 	iov.iov_len = len;
@@ -913,8 +891,10 @@ static int qcn_feedback_controller(void *arg)
 	struct Qdisc *sch = arg;
 	struct htb_sched *q = qdisc_priv(sch);
 	struct qcn_kthread_t *th = &q->th;
+	struct htb_class *cl;
 	struct qcn_frame frame;
 	struct timeval tv;
+	u32 dec_factor;
 	int err, size;
 
 	printk(KERN_EMERG THREAD_NAME": success!\n");
@@ -946,19 +926,57 @@ static int qcn_feedback_controller(void *arg)
 
 	while (!kthread_should_stop()) {
 		memset(&frame, 0, sizeof(struct qcn_frame));
-
 		size = qcn_recv_fb(th->sock, &th->addr, (char *)&frame,
 						   sizeof(struct qcn_frame));
 
-		if (size < 0)
+		if (size >= 0) {
+			if (size != sizeof(struct qcn_frame)) {
+				printk(KERN_EMERG "error: recv (%d) != qcn_frame size (%d)",
+					   size, sizeof(struct qcn_frame));
+			}
+			else {
+				printk(KERN_EMERG "QCN Frame received! Fb %x, src %x, dst %x, \
+qoff %x, qdelta %x", frame.Fb, frame.SA, frame.DA, frame.qoff, frame.qdelta);
+			}
+			/* Testing */
+			continue;
+
+			if ((cl = htb_find(gethandle(frame.SA, frame.DA), sch)) != NULL) {
+				frame.Fb = ntohl(frame.Fb);
+				frame.qoff = ntohl(frame.qoff);
+				if (frame.Fb != 0) {
+					spin_lock(&cl->rate_lock);
+					/* Use the current rate as the next target rate
+					   In the first cycle of fast recovery, the Fb
+					   signal would not reset the target rate */
+					if (cl->bcount_stg != 0) {
+						cl->trate = min(cl->crate, cl->rate->rate.rate);
+						cl->bcount_tx = QCN_BC;
+						cl->timer = psched_get_time() + QCN_TIMER;
+					}
+
+					/* Set the stage counters */
+					cl->bcount_stg = 0;
+					cl->timer_stg = 0;
+					
+					/* Update the current rate, multiplicative decrease */
+					/* Changing the expression to avoid the use of floating
+					   point values */
+					dec_factor = (cl->crate * frame.Fb) >> QCN_GD;
+					dec_factor = max(cl->crate >> QCN_MIN_RATE_DEC, dec_factor);
+					cl->crate = cl->crate - dec_factor;
+					cl->crate = min(cl->crate, (u32) QCN_MIN_RATE);
+					spin_unlock(&cl->rate_lock);
+				}
+			}
+			else
+				printk(KERN_EMERG "Class not found!\n");
+
+		}
+		else {
 			/* printk(KERN_EMERG "Error %d while recving Fb (EAGAIN = %d)\n",  */
 			/* 	   size, EAGAIN); */
-		else {
-			
-			/* htb_find(); */
-			printk(KERN_EMERG "Received %d bytes\n", size);
 		}
-
 	}
 
 out:
@@ -1270,20 +1288,9 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 		q->rate2quantum = 1;
 	q->defcls = gopt->defcls;
 
-	/* QCN Parameters */
-	printk(KERN_EMERG "Initializing QCN RP parameters");
+	/* QCN Variables */
+	printk(KERN_EMERG "Initializing QCN RP clock factor");
 
-	/* Rates are always in bytes/sec  */
-	/* q->qcn_TIMER = 25; */
-	/* q->qcn_FASTREC = 5; */
-	/* q->qcn_BC = 153600; */
-	/* q->qcn_AI_INC = 524288; */
-	/* q->qcn_HAI_INC = 5242880; */
-	/* q->qcn_GD = 7; 				/\* = 1/128 *\/ */
-	/* q->qcn_MIN_RATE = 524288; */
-	/* q->qcn_MIN_RATE_DEC = 2;	/\* = 1/2 *\/ */
-	/* q->qcn_C = 125000000;		/\* = 1Gbit*\/ */
- 
 	/* From iproute2/tc/tc_core.c */
 	q->clock_factor = (u32)NSEC_PER_USEC * 1000000 / (u32)PSCHED_TICKS2NS(1);
 
@@ -1296,8 +1303,11 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 	if (IS_ERR(q->th.tsk)) {
 		printk(KERN_EMERG "Unable to start QCN Feedback Controller\n");
 		kfree(q->th.tsk);
+		q->th.tsk = NULL;
+	} else {
+		wake_up_process(q->th.tsk);
 	}
-	wake_up_process(q->th.tsk);
+
 
 	return 0;
 }
@@ -1491,12 +1501,6 @@ static void htb_destroy(struct Qdisc *sch)
 		printk(KERN_EMERG "QCN Feedback Controller is not running!");
 	else
 		kthread_stop(q->th.tsk);
-
-	/* The thread will release its socket */
-	/* if (q->th.sock != NULL) { */
-	/* 	sock_release(q->th.sock); */
-	/* 	q->th.sock = NULL; */
-	/* } */
 
 	cancel_work_sync(&q->work);
 	qdisc_watchdog_cancel(&q->watchdog);
@@ -1698,8 +1702,13 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 		cl->t_c = psched_get_time();
 		cl->cmode = HTB_CAN_SEND;
 
-		/* QCN Initialization */
+		/* QCN RP Initialization */
 		spin_lock_init(&cl->rate_lock);
+		cl->bcount_stg = 0;
+		cl->timer_stg = 0;
+		cl->bcount_tx = 0;
+		cl->timer = 0;
+
 		
 		/* attach to the hash list and parent's family */
 		qdisc_class_hash_insert(&q->clhash, &cl->common);
@@ -1744,10 +1753,14 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 	if (cl->rate)
 		qdisc_put_rtab(cl->rate);
 	cl->rate = rtab;
-	printk(KERN_EMERG "new rate: %u\n", cl->rate->rate.rate);
 	if (cl->ceil)
 		qdisc_put_rtab(cl->ceil);
 	cl->ceil = ctab;
+
+	/* QCN RP Rates Initialization */
+	cl->crate = cl->rate->rate.rate;
+	cl->trate = cl->rate->rate.rate;
+
 	sch_tree_unlock(sch);
 
 	qdisc_class_hash_grow(sch, &q->clhash);
