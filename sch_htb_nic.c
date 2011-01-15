@@ -43,9 +43,23 @@
 #include <linux/kthread.h>
 #include <linux/ip.h>
 #include <linux/wait.h>
+#include <linux/time.h>
+#include <linux/errno.h>
+#include <net/sock.h>
 
-#define LISTEN_PORT 6660
-#define THREAD_NAME "QCNFbController"
+#define THREAD_NAME        "QCNFbController"
+#define LISTEN_PORT        6660
+
+/* QCN Parameters */
+#define QCN_TIMER          25*PSCHED_TICKS_PER_SEC/1000
+#define QCN_FASTREC        5
+#define QCN_BC             153600	 /* 150KB */
+#define QCN_AI             524288	 /* 0.5MB */
+#define QCN_HAI            5242880	 /* 5MB */
+#define QCN_GD             7		 /* 1/128 */
+#define QCN_MIN_RATE       524288	 /* 0.5MB */
+#define QCN_MIN_RATE_DEC   2		 /* = 1/2 */
+#define QCN_C              125000000 /* 1GB */
 
 /* HTB algorithm.
     Author: devik@cdi.cz
@@ -130,27 +144,26 @@ struct htb_class {
 	psched_tdiff_t mbuffer;	/* max wait time */
 	long tokens, ctokens;	/* current number of tokens */
 	psched_time_t t_c;	/* checkpoint time */
-	psched_time_t t_p; 	/* time - 1sec */
 
 	/* QCN Variables */
-	__u32 qcn_TR;
-	__u32 qcn_CR;
-	__u32 qcn_byte_ctr;
-	__u16 qcn_byte_state;
-	__u16 qcn_timer_state;
-	psched_time_t qcn_timer;
-	spinlock_t R_lock;
+	spinlock_t rate_lock;
+	__u32 trate;			/* Target rate */
+	__u32 crate;			/* Current rate */
+	__u32 bcount_tx;		/* Byte counter */
+	__u16 bcount_stg;		/* Byte counter stage (si_count) */
+	psched_time_t timer;	/* Timer */
+	__u16 timer_stg;		/* Timer stage */
 
 	/* QCN Parameters */
-	psched_time_t qcn_TIMER;	/* Timer time-out threshold */
-	__u32 qcn_FASTREC;			/* Fast recovery threshold */
-	__u32 qcn_BC;				/* Byte counter time-out */
-	__u32 qcn_AI_INC;			/* Rate increase in the AI stage */
-	__u32 qcn_HAI_INC;			/* Rate increase in the HAI stage */
-	__u32 qcn_GD;				/* Control gain parameter */
-	__u32 qcn_MIN_RATE;			/* Minimum rate of a rate limiter */
-	__u32 qcn_MIN_RATE_DEC;		/* Minimum rate descrease factor */
-	__u32 qcn_C;				/* Link speed */
+	/* psched_time_t qcn_TIMER;	/\* Timer time-out threshold *\/ */
+	/* __u32 qcn_FASTREC;			/\* Fast recovery threshold *\/ */
+	/* __u32 qcn_BC;				/\* Byte counter threshold *\/ */
+	/* __u32 qcn_AI_INC;			/\* Rate increase in the AI stage *\/ */
+	/* __u32 qcn_HAI_INC;			/\* Rate increase in the HAI stage *\/ */
+	/* __u32 qcn_GD;				/\* Control gain parameter *\/ */
+	/* __u32 qcn_MIN_RATE;			/\* Minimum rate of a rate limiter *\/ */
+	/* __u32 qcn_MIN_RATE_DEC;		/\* Minimum rate descrease factor *\/ */
+	/* __u32 qcn_C;				/\* Link speed *\/ */
 };
 
 struct qcn_kthread_t {
@@ -158,8 +171,6 @@ struct qcn_kthread_t {
 	struct sockaddr_in addr;
 	struct socket *sock;		/* Socket to recv Fb */
 	struct Qdisc *sch;			/* The scheduler itself */
-	/* Do we need to wait for thread's completion? */
-	/* struct completion; */
 };
 
 struct htb_sched {
@@ -198,15 +209,22 @@ struct htb_sched {
 	struct work_struct work;
 
 	/* QCN Parameters */
-	psched_time_t qcn_TIMER;	/* Timer time-out threshold */
-	__u32 qcn_FASTREC;			/* Fast recovery threshold */
-	__u32 qcn_BC;				/* Byte counter time-out */
-	__u32 qcn_AI_INC;			/* Rate increase in the AI stage */
-	__u32 qcn_HAI_INC;			/* Rate increase in the HAI stage */
-	__u32 qcn_GD;				/* Control gain parameter */
-	__u32 qcn_MIN_RATE;			/* Minimum rate of a rate limiter */
-	__u32 qcn_MIN_RATE_DEC;		/* Minimum rate descrease factor */
-	__u32 qcn_C;				/* Link speed */
+	/* psched_time_t qcn_TIMER;	/\* Timer time-out threshold *\/ */
+	/* __u32 qcn_FASTREC;			/\* Fast recovery threshold *\/ */
+	/* __u32 qcn_BC;				/\* Byte counter time-out *\/ */
+	/* __u32 qcn_AI_INC;			/\* Rate increase in the AI stage *\/ */
+	/* __u32 qcn_HAI_INC;			/\* Rate increase in the HAI stage *\/ */
+	/* __u32 qcn_GD;				/\* Control gain parameter *\/ */
+	/* __u32 qcn_MIN_RATE;			/\* Minimum rate of a rate limiter *\/ */
+	/* __u32 qcn_MIN_RATE_DEC;		/\* Minimum rate descrease factor *\/ */
+	/* __u32 qcn_C;				/\* Link speed *\/ */
+
+	/* HTB uses a lookup table (rtable) to translate packet sizes to 
+	   # of tokens. However, this table is built in userspace. Therefore,
+	   when executing the QCN's Reaction Point algorithm, we ignore the rtable
+	   and translate pkt size to tokens by hand using the following variable.
+	*/
+	__u32 clock_factor;
 
 	/* Feedback Controller thread */
 	struct qcn_kthread_t th;
@@ -645,26 +663,96 @@ static int htb_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 	return NET_XMIT_SUCCESS;
 }
 
-static inline void htb_accnt_tokens(struct htb_class *cl, int bytes, long diff)
+static inline void qcn_self_increase (struct htb_class *cl) {
+	__u32 Ri;
+
+	/* self increase */
+	if (cl->bcount_stg > QCN_FASTREC ||
+		cl->timer_stg > QCN_FASTREC) {
+		if (cl->bcount_stg > QCN_FASTREC &&
+				cl->timer_stg > QCN_FASTREC)
+			/* Hyperactive increase */
+			Ri = QCN_HAI;
+		else
+			Ri = QCN_AI;
+	}
+	else
+		Ri = 0;
+	
+	/* At the end of the first cycle of recovery */
+	if ((cl->bcount_stg == 1 || cl->timer_stg == 1) &&
+		cl->trate > 10 * cl->crate)
+		cl->trate = cl->trate >> 3;
+	else
+		cl->trate += Ri;
+	
+	cl->crate = (cl->trate + cl->crate) >> 1;
+}
+
+static inline void htb_accnt_tokens(struct htb_class *cl, int bytes, 
+									long diff, __u32 clock_factor)
 {
 	long toks = diff + cl->tokens;
+	psched_time_t now;
 
 	if (toks > cl->buffer)
 		toks = cl->buffer;
-	toks -= (long) qdisc_l2t(cl->rate, bytes);
+
+	if (cl->crate >= cl->rate->rate.rate)
+		toks -= (long) qdisc_l2t(cl->rate, bytes);
+	else {
+		spin_lock(&cl->rate_lock);
+
+		toks -= (long) (bytes/cl->crate) * clock_factor;
+
+		/* QCN Reaction Point Algorithm */
+
+		/* Updating timer */
+		now = psched_get_time();
+		if (now > cl->timer) {
+			cl->timer_stg++;
+			qcn_self_increase(cl);
+			if (cl->timer_stg < QCN_FASTREC)
+				cl->timer = now + QCN_FASTREC; /* TODO: "Randomize" */
+			else
+				cl->timer = now + (QCN_FASTREC >> 1);
+		}
+		
+		/* Updating byte counter */
+		if (cl->bcount_tx <= bytes) {
+			cl->bcount_stg++;
+			if (cl->bcount_stg < QCN_FASTREC)
+				cl->bcount_tx = QCN_BC; /* TODO: "Randomize" */
+			else
+				cl->bcount_tx = QCN_BC >> 1;
+			qcn_self_increase(cl);
+		}
+		else
+			cl->bcount_tx -= bytes;
+			
+		spin_unlock(&cl->rate_lock);
+	}
+
 	if (toks <= -cl->mbuffer)
 		toks = 1 - cl->mbuffer;
 
 	cl->tokens = toks;
 }
 
-static inline void htb_accnt_ctokens(struct htb_class *cl, int bytes, long diff)
+static inline void htb_accnt_ctokens(struct htb_class *cl, int bytes, 
+									 long diff, __u32 clock_factor)
 {
 	long toks = diff + cl->ctokens;
 
 	if (toks > cl->cbuffer)
 		toks = cl->cbuffer;
-	toks -= (long) qdisc_l2t(cl->ceil, bytes);
+
+	if (cl->crate >= cl->rate->rate.rate)
+		toks -= (long) qdisc_l2t(cl->ceil, bytes);
+	else
+		/* Spinlock, where are you? */
+		toks -= (long) (bytes/cl->crate) * clock_factor;
+
 	if (toks <= -cl->mbuffer)
 		toks = 1 - cl->mbuffer;
 
@@ -694,12 +782,12 @@ static void htb_charge_class(struct htb_sched *q, struct htb_class *cl,
 		if (cl->level >= level) {
 			if (cl->level == level)
 				cl->xstats.lends++;
-			htb_accnt_tokens(cl, bytes, diff);
+			htb_accnt_tokens(cl, bytes, diff, q->clock_factor);
 		} else {
 			cl->xstats.borrows++;
 			cl->tokens += diff;	/* we moved t_c; update tokens */
 		}
-		htb_accnt_ctokens(cl, bytes, diff);
+		htb_accnt_ctokens(cl, bytes, diff, q->clock_factor);
 		cl->t_c = q->now;
 
 		old_mode = cl->cmode;
@@ -786,6 +874,39 @@ static struct rb_node *htb_id_find_next_upper(int prio, struct rb_node *n,
 	return r;
 }
 
+static inline int qcn_recv_fb(struct socket* sock, struct sockaddr_in* addr,
+							  unsigned char* buf, int len) {
+	struct msghdr msg;
+	struct iovec iov;
+	mm_segment_t oldfs;
+	int size = 0;
+
+	if (sock->sk == NULL) {
+		printk(KERN_EMERG "Null sk pointer? What are you trying to do?");
+		return 0;
+	}
+
+	iov.iov_base = buf;
+	iov.iov_len = len;
+	
+	msg.msg_flags = 0;
+	msg.msg_name = addr;
+	msg.msg_namelen  = sizeof(struct sockaddr_in);
+	msg.msg_control = NULL;
+	msg.msg_controllen = 0;
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = NULL;
+
+	oldfs = get_fs();
+	set_fs(KERNEL_DS);
+	size = sock_recvmsg(sock,&msg,len,msg.msg_flags);
+	set_fs(oldfs);
+
+	return size;
+
+}
+
 /* Feedback Controller Thread */
 static int qcn_feedback_controller(void *arg)
 {
@@ -793,11 +914,9 @@ static int qcn_feedback_controller(void *arg)
 	struct htb_sched *q = qdisc_priv(sch);
 	struct qcn_kthread_t *th = &q->th;
 	struct qcn_frame frame;
+	struct timeval tv;
 	int err, size;
 
-	/* Testing */
-	DECLARE_WAIT_QUEUE_HEAD(my_queue);
-	
 	printk(KERN_EMERG THREAD_NAME": success!\n");
 
 	/* Creating a socket to recv udp messages */
@@ -817,19 +936,25 @@ static int qcn_feedback_controller(void *arg)
 			   err);
 		goto out;
 	}
+	memset(&tv, 0, sizeof(struct timeval));
+	tv.tv_usec = 10000;			/* 10ms */
+	if ((err = sock_setsockopt(th->sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv,
+							   sizeof(struct timeval))) != 0) {
+		printk(KERN_EMERG "setsockopt error = %d\n", err);
+		goto out;
+	}
 
 	while (!kthread_should_stop()) {
-
 		memset(&frame, 0, sizeof(struct qcn_frame));
 
-		size = 0;
-		wait_event_interruptible_timeout(my_queue, 0, HZ);
-		/* size = qcn_recv_fb(q->th->sock, &q->th->addr, frame, */
-		/* 				   sizeof(struct qcn_frame)); */
+		size = qcn_recv_fb(th->sock, &th->addr, (char *)&frame,
+						   sizeof(struct qcn_frame));
 
 		if (size < 0)
-			printk(KERN_EMERG "Error %d while recving Fb\n", size);
+			/* printk(KERN_EMERG "Error %d while recving Fb (EAGAIN = %d)\n",  */
+			/* 	   size, EAGAIN); */
 		else {
+			
 			/* htb_find(); */
 			printk(KERN_EMERG "Received %d bytes\n", size);
 		}
@@ -840,7 +965,7 @@ out:
 	printk(KERN_EMERG THREAD_NAME": releasing socket\n");
 	sock_release(th->sock);
 	th->sock = NULL;
-	
+	th->tsk = NULL;
 	return 0;
 }
 
@@ -1149,15 +1274,18 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 	printk(KERN_EMERG "Initializing QCN RP parameters");
 
 	/* Rates are always in bytes/sec  */
-	q->qcn_TIMER = 25;
-	q->qcn_FASTREC = 5;
-	q->qcn_BC = 153600;
-	q->qcn_AI_INC = 524288;
-	q->qcn_HAI_INC = 5242880;
-	q->qcn_GD = 7; 				/* = 1/128 */
-	q->qcn_MIN_RATE = 524288;
-	q->qcn_MIN_RATE_DEC = 2;	/* = 1/2 */
-	q->qcn_C = 125000000;		/* = 1Gbit*/
+	/* q->qcn_TIMER = 25; */
+	/* q->qcn_FASTREC = 5; */
+	/* q->qcn_BC = 153600; */
+	/* q->qcn_AI_INC = 524288; */
+	/* q->qcn_HAI_INC = 5242880; */
+	/* q->qcn_GD = 7; 				/\* = 1/128 *\/ */
+	/* q->qcn_MIN_RATE = 524288; */
+	/* q->qcn_MIN_RATE_DEC = 2;	/\* = 1/2 *\/ */
+	/* q->qcn_C = 125000000;		/\* = 1Gbit*\/ */
+ 
+	/* From iproute2/tc/tc_core.c */
+	q->clock_factor = (u32)NSEC_PER_USEC * 1000000 / (u32)PSCHED_TICKS2NS(1);
 
 	/* Creating the Feedback Controller thread */
 	memset(&q->th, 0, sizeof(struct qcn_kthread_t));
@@ -1254,7 +1382,7 @@ htb_dump_class_stats(struct Qdisc *sch, unsigned long arg, struct gnet_dump *d)
 	cl->xstats.ctokens = cl->ctokens;
 
 	if (gnet_stats_copy_basic(d, &cl->bstats) < 0 ||
-	    gnet_stats_copy_rate_est(d, &cl->rate_est) < 0 ||
+	    gnet_stats_copy_rate_est(d, NULL, &cl->rate_est) < 0 ||
 	    gnet_stats_copy_queue(d, &cl->qstats) < 0)
 		return -1;
 
@@ -1269,8 +1397,7 @@ static int htb_graft(struct Qdisc *sch, unsigned long arg, struct Qdisc *new,
 	if (cl->level)
 		return -EINVAL;
 	if (new == NULL &&
-	    (new = qdisc_create_dflt(qdisc_dev(sch), sch->dev_queue,
-				     &pfifo_qdisc_ops,
+	    (new = qdisc_create_dflt(sch->dev_queue, &pfifo_qdisc_ops,
 				     cl->common.classid)) == NULL)
 		return -ENOBUFS;
 
@@ -1390,7 +1517,6 @@ static void htb_destroy(struct Qdisc *sch)
 	}
 	qdisc_class_hash_destroy(&q->clhash);
 	__skb_queue_purge(&q->direct_queue);
-
 }
 
 static int htb_delete(struct Qdisc *sch, unsigned long arg)
@@ -1408,8 +1534,7 @@ static int htb_delete(struct Qdisc *sch, unsigned long arg)
 		return -EBUSY;
 
 	if (!cl->level && htb_parent_last_child(cl)) {
-		new_q = qdisc_create_dflt(qdisc_dev(sch), sch->dev_queue,
-					  &pfifo_qdisc_ops,
+		new_q = qdisc_create_dflt(sch->dev_queue, &pfifo_qdisc_ops,
 					  cl->parent->common.classid);
 		last_child = 1;
 	}
@@ -1463,14 +1588,14 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 	struct htb_class *cl = (struct htb_class *)*arg, *parent;
 	struct nlattr *opt = tca[TCA_OPTIONS];
 	struct qdisc_rate_table *rtab = NULL, *ctab = NULL;
-	struct nlattr *tb[TCA_HTB_RTAB + 1];
+	struct nlattr *tb[__TCA_HTB_MAX];
 	struct tc_htb_opt *hopt;
 
 	/* extract all subattrs from opt attr */
 	if (!opt)
 		goto failure;
 
-	err = nla_parse_nested(tb, TCA_HTB_RTAB, opt, htb_policy);
+	err = nla_parse_nested(tb, TCA_HTB_MAX, opt, htb_policy);
 	if (err < 0)
 		goto failure;
 
@@ -1527,8 +1652,6 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 			goto failure;
 		}
 
-		cl->t_p = psched_get_time();
-
 		cl->refcnt = 1;
 		cl->children = 0;
 		INIT_LIST_HEAD(&cl->un.leaf.drop_list);
@@ -1540,7 +1663,7 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 		/* create leaf qdisc early because it uses kmalloc(GFP_KERNEL)
 		   so that can't be used inside of sch_tree_lock
 		   -- thanks to Karlis Peisenieks */
-		new_q = qdisc_create_dflt(qdisc_dev(sch), sch->dev_queue,
+		new_q = qdisc_create_dflt(sch->dev_queue,
 					  &pfifo_qdisc_ops, classid);
 		sch_tree_lock(sch);
 		if (parent && !parent->level) {
@@ -1575,14 +1698,15 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 		cl->t_c = psched_get_time();
 		cl->cmode = HTB_CAN_SEND;
 
-		/* QCN Parameters */
+		/* QCN Initialization */
+		spin_lock_init(&cl->rate_lock);
 		
-
 		/* attach to the hash list and parent's family */
 		qdisc_class_hash_insert(&q->clhash, &cl->common);
 		if (parent)
 			parent->children++;
-	} else {
+	} /* new class end */
+	else {
 		if (tca[TCA_RATE]) {
 			err = gen_replace_estimator(&cl->bstats, &cl->rate_est,
 						    qdisc_root_sleeping_lock(sch),
@@ -1620,6 +1744,7 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 	if (cl->rate)
 		qdisc_put_rtab(cl->rate);
 	cl->rate = rtab;
+	printk(KERN_EMERG "new rate: %u\n", cl->rate->rate.rate);
 	if (cl->ceil)
 		qdisc_put_rtab(cl->ceil);
 	cl->ceil = ctab;
