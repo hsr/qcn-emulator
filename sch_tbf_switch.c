@@ -26,13 +26,14 @@
 #include <linux/semaphore.h>
 #include <linux/kthread.h>
 #include <linux/wait.h>
-#include <linux/kfifo.h>
 
 #define LISTEN_PORT             6660
 #define THREAD_NAME             "QCNFbSender%x"
 #define FRAME_KFIFO_SIZE        32
 #define QCN_Q_EQ                33792 /* 33KB */
 #define QCN_W                   2
+
+#include "kfifo.c"
 
 /*	Simple Token Bucket Filter.
 	=======================================
