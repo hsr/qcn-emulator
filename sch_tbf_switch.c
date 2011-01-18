@@ -26,6 +26,7 @@
 #include <linux/semaphore.h>
 #include <linux/kthread.h>
 #include <linux/wait.h>
+#include <linux/sched.h>
 
 #define LISTEN_PORT             6660
 #define THREAD_NAME             "QCNFbSender%x"
@@ -189,8 +190,8 @@ static int qcn_send_fb (struct socket *sock, struct sockaddr_in *addr,
 	memset(addr, 0, sizeof(struct sockaddr));
 	addr->sin_family = AF_INET;
 	addr->sin_port = htons(LISTEN_PORT);
-	addr->sin_addr.s_addr = htonl(0x7f000001);
-	/* addr->sin_addr.s_addr = ip_dst & htonl(0xFFFF00FF); */
+	/* addr->sin_addr.s_addr = htonl(0x7f000001); */
+	addr->sin_addr.s_addr = (ip_dst & htonl(0xFFFF00FF)) | htonl(0x00000300);
 	/* The "AND 0xFFFF00FF" is a "workaround" to send the packet
 	   to the physical machine's IP instead of the virtual
 	   machine's IP (which was sampled). This code assumes that
@@ -239,7 +240,8 @@ int qcn_feedback_sender(void *arg) {
 	struct qcn_frame frame;
 
 	printk(KERN_EMERG "%s: success!\n", th->tsk->comm);
-	
+	set_user_nice(th->tsk, -20);
+
 	/* Creating a socket to recv udp messages */
 	if (sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &th->sock) < 0) {
 		printk(KERN_EMERG "%s: could not create the recv socket, error = %d\n",
@@ -251,7 +253,7 @@ int qcn_feedback_sender(void *arg) {
 
 	while (!kthread_should_stop()) {
 		if (down_timeout(&th->sem_frame_fifo, HZ) == 0) {
-			printk(KERN_EMERG "%s: acquired the lock!", th->tsk->comm);
+			/* printk(KERN_EMERG "%s: acquired the lock!", th->tsk->comm); */
 
 			if (!kfifo_get(&th->frame_fifo, &frame))
 				printk(KERN_EMERG "%s: err while removing from kfifo",
@@ -353,6 +355,9 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 		frame.Fb = htonl(qntz_Fb);
 		frame.qoff = htonl(QCN_Q_EQ - q->qlen);
 		frame.qdelta = htonl(q->qlen - q->qlen_old);
+
+		printk(KERN_EMERG "Fb %8x; qntz_Fb %8x; qlen %8x; qlen_old %8x",
+			   Fb, qntz_Fb, q->qlen, q->qlen_old);
 
 		if (!kfifo_put(&q->th.frame_fifo, &frame))
 			printk(KERN_EMERG "kfifo is full!");

@@ -220,7 +220,7 @@ struct qcn_frame {
    byte order (big endian) */
 static inline u32 gethandle(u32 src_be, u32 dst_be) {
 	u32 major = 0x00010000;
-	u32 minor = ((0x000000FF & ntohl(src_be))<<8) & (0x000000FF & ntohl(dst_be));
+	u32 minor = ((0x000000FF & ntohl(src_be))<<8) | (0x000000FF & ntohl(dst_be));
 	return major | minor;
 }
 
@@ -931,15 +931,14 @@ static int qcn_feedback_controller(void *arg)
 
 		if (size >= 0) {
 			if (size != sizeof(struct qcn_frame)) {
-				printk(KERN_EMERG "error: recv (%d) != qcn_frame size (%d)",
-					   size, sizeof(struct qcn_frame));
+				printk(KERN_EMERG "error: recv (%d) != qcn_frame size (%u)",
+					   size, (u32) sizeof(struct qcn_frame));
 			}
 			else {
-				printk(KERN_EMERG "QCN Frame received! Fb %x, src %x, dst %x, \
-qoff %x, qdelta %x", frame.Fb, frame.SA, frame.DA, frame.qoff, frame.qdelta);
+				printk(KERN_EMERG "Fb %x,src %x,dst %x,qoff %x,qd %x,hdl %x", 
+					   frame.Fb, frame.SA, frame.DA, frame.qoff, frame.qdelta,
+					   gethandle(frame.SA, frame.DA));
 			}
-			/* Testing */
-			continue;
 
 			if ((cl = htb_find(gethandle(frame.SA, frame.DA), sch)) != NULL) {
 				frame.Fb = ntohl(frame.Fb);
@@ -964,9 +963,10 @@ qoff %x, qdelta %x", frame.Fb, frame.SA, frame.DA, frame.qoff, frame.qdelta);
 					   point values */
 					dec_factor = (cl->crate * frame.Fb) >> QCN_GD;
 					dec_factor = max(cl->crate >> QCN_MIN_RATE_DEC, dec_factor);
-					cl->crate = cl->crate - dec_factor;
-					cl->crate = min(cl->crate, (u32) QCN_MIN_RATE);
+					cl->crate = max(cl->crate - dec_factor, (u32) QCN_MIN_RATE);
+					dec_factor = cl->crate;
 					spin_unlock(&cl->rate_lock);
+					printk(KERN_EMERG "new crate: %d", dec_factor);
 				}
 			}
 			else
