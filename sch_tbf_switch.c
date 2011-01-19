@@ -252,7 +252,7 @@ int qcn_feedback_sender(void *arg) {
 	}
 
 	while (!kthread_should_stop()) {
-		if (down_timeout(&th->sem_frame_fifo, HZ) == 0) {
+		if (down_timeout(&th->sem_frame_fifo, HZ/100) == 0) {
 			/* printk(KERN_EMERG "%s: acquired the lock!", th->tsk->comm); */
 
 			if (!kfifo_get(&th->frame_fifo, &frame))
@@ -266,7 +266,8 @@ int qcn_feedback_sender(void *arg) {
 					   th->tsk->comm, frame.SA);
 
 		} else {
-			/* printk(KERN_EMERG "%s: down_timeout!", th->tsk->comm); */
+			/* printk(KERN_EMERG "%s: down_timeout at proc %i!", */
+			/*	   th->tsk->comm, smp_processor_id()); */
 		}
 	}
 
@@ -582,7 +583,8 @@ static int tbf_init(struct Qdisc* sch, struct nlattr *opt)
 		printk(KERN_EMERG "error kfifo_alloc\n");
 		q->th.frame_fifo_alloc = 1;
 	}
-
+	/* printk(KERN_EMERG "creating thread at processor %i", */
+	/*          smp_processor_id()); */
 	q->th.tsk = kthread_create(qcn_feedback_sender, sch,
 							   THREAD_NAME, sch->handle);
 	if (IS_ERR(q->th.tsk)) {
