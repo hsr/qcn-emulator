@@ -40,17 +40,9 @@
 #include <net/netlink.h>
 #include <net/pkt_sched.h>
 
-#include <linux/kthread.h>
 #include <linux/ip.h>
-#include <linux/wait.h>
-#include <linux/time.h>
-#include <linux/errno.h>
-#include <net/sock.h>
 
-#define THREAD_NAME        "QCNFbController"
-#define LISTEN_PORT        6660
-
-/* QCN Parameters (rates are always bytes/sec */
+/* QCN Parameters (rates are always in bytes/sec) */
 #define QCN_TIMER          25*PSCHED_TICKS_PER_SEC/1000
 #define QCN_FASTREC        5
 #define QCN_BC             153600	 /* 150KB */
@@ -156,13 +148,6 @@ struct htb_class {
 
 };
 
-struct qcn_kthread_t {
-	struct task_struct *tsk;
-	struct sockaddr_in addr;
-	struct socket *sock;		/* Socket to recv Fb */
-	struct Qdisc *sch;			/* The scheduler itself */
-};
-
 struct htb_sched {
 	struct Qdisc_class_hash clhash;
 	struct list_head drops[TC_HTB_NUMPRIO];/* active leaves (for drops) */
@@ -204,8 +189,6 @@ struct htb_sched {
 	   and translate pkt size to tokens by hand using the following variable. */
 	__u32 clock_factor;
 
-	/* Feedback Controller thread */
-	struct qcn_kthread_t th;
 };
 
 struct qcn_frame {
@@ -854,137 +837,53 @@ static struct rb_node *htb_id_find_next_upper(int prio, struct rb_node *n,
 	return r;
 }
 
-static inline int qcn_recv_fb(struct socket* sock, struct sockaddr_in* addr,
-							  unsigned char* buf, int len) {
-	struct msghdr msg;
-	struct iovec iov;
-	mm_segment_t oldfs;
-	int size = 0;
-
-	if (sock->sk == NULL) 
-		return 0;
-
-	iov.iov_base = buf;
-	iov.iov_len = len;
-	
-	msg.msg_flags = 0;
-	msg.msg_name = addr;
-	msg.msg_namelen  = sizeof(struct sockaddr_in);
-	msg.msg_control = NULL;
-	msg.msg_controllen = 0;
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_control = NULL;
-
-	oldfs = get_fs();
-	set_fs(KERNEL_DS);
-	size = sock_recvmsg(sock,&msg,len,msg.msg_flags);
-	set_fs(oldfs);
-
-	return size;
-
-}
-
-/* Feedback Controller Thread */
-static int qcn_feedback_controller(void *arg)
+static int qcn_recv_fb(struct Qdisc *sch, struct nlattr *opt)
 {
-	struct Qdisc *sch = arg;
 	struct htb_sched *q = qdisc_priv(sch);
-	struct qcn_kthread_t *th = &q->th;
+	struct qcn_frame *frame = (struct qcn_frame *)opt;
 	struct htb_class *cl;
-	struct qcn_frame frame;
-	struct timeval tv;
 	u32 dec_factor;
 	int err, size;
 
-	printk(KERN_EMERG THREAD_NAME": success!\n");
-
-	/* Creating a socket to recv udp messages */
-	if (sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &th->sock) < 0) {
-		printk(KERN_EMERG "Could not create the recv socket, error = %d\n",
-			   -ENXIO);
-		goto out;
-	}
-
-	memset(&th->addr, 0, sizeof(struct sockaddr));
-	th->addr.sin_family = AF_INET;
-	th->addr.sin_port = htons(LISTEN_PORT);
-	th->addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	if ((err = th->sock->ops->bind(th->sock, (struct sockaddr *)&th->addr,
-								   sizeof(struct sockaddr))) < 0) {
-		printk(KERN_EMERG "Could not bind the recv socket, error = %d\n",
-			   err);
-		goto out;
-	}
-	memset(&tv, 0, sizeof(struct timeval));
-	tv.tv_usec = 10000;			/* 10ms */
-	if ((err = sock_setsockopt(th->sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&tv,
-							   sizeof(struct timeval))) != 0) {
-		printk(KERN_EMERG "setsockopt error = %d\n", err);
-		goto out;
-	}
-
-	while (!kthread_should_stop()) {
-		memset(&frame, 0, sizeof(struct qcn_frame));
-		size = qcn_recv_fb(th->sock, &th->addr, (char *)&frame,
-						   sizeof(struct qcn_frame));
-
-		if (size >= 0) {
-			if (size != sizeof(struct qcn_frame)) {
-				printk(KERN_EMERG "error: recv (%d) != qcn_frame size (%u)",
-					   size, (u32) sizeof(struct qcn_frame));
+	size = qcn_recv_fb(th->sock, &th->addr, (char *)&frame,
+					   sizeof(struct qcn_frame));
+	
+	
+	printk(KERN_EMERG "Fb %x,src %x,dst %x,qoff %x,qd %x,hdl %x", 
+		   frame->Fb, frame->SA, frame->DA, frame->qoff, frame->qdelta,
+		   gethandle(frame->SA, frame->DA));
+		
+	if ((cl = htb_find(gethandle(frame->SA, frame->DA), sch)) != NULL) {
+		frame->Fb = ntohl(frame->Fb);
+		frame->qoff = ntohl(frame->qoff);
+		if (frame->Fb != 0) {
+			spin_lock(&cl->rate_lock);
+			/* Use the current rate as the next target rate
+			   In the first cycle of fast recovery, the Fb
+			   signal would not reset the target rate */
+			if (cl->bcount_stg != 0) {
+				cl->trate = min(cl->crate, cl->rate->rate.rate);
+				cl->bcount_tx = QCN_BC;
+				cl->timer = psched_get_time() + QCN_TIMER;
 			}
-			else {
-				printk(KERN_EMERG "Fb %x,src %x,dst %x,qoff %x,qd %x,hdl %x", 
-					   frame.Fb, frame.SA, frame.DA, frame.qoff, frame.qdelta,
-					   gethandle(frame.SA, frame.DA));
-			}
-
-			if ((cl = htb_find(gethandle(frame.SA, frame.DA), sch)) != NULL) {
-				frame.Fb = ntohl(frame.Fb);
-				frame.qoff = ntohl(frame.qoff);
-				if (frame.Fb != 0) {
-					spin_lock(&cl->rate_lock);
-					/* Use the current rate as the next target rate
-					   In the first cycle of fast recovery, the Fb
-					   signal would not reset the target rate */
-					if (cl->bcount_stg != 0) {
-						cl->trate = min(cl->crate, cl->rate->rate.rate);
-						cl->bcount_tx = QCN_BC;
-						cl->timer = psched_get_time() + QCN_TIMER;
-					}
-
-					/* Set the stage counters */
-					cl->bcount_stg = 0;
-					cl->timer_stg = 0;
-					
-					/* Update the current rate, multiplicative decrease */
-					/* Changing the expression to avoid the use of floating
-					   point values */
-					dec_factor = (cl->crate * frame.Fb) >> QCN_GD;
-					dec_factor = max(cl->crate >> QCN_MIN_RATE_DEC, dec_factor);
-					cl->crate = max(cl->crate - dec_factor, (u32) QCN_MIN_RATE);
-					dec_factor = cl->crate;
-					spin_unlock(&cl->rate_lock);
-					printk(KERN_EMERG "new crate: %d", dec_factor);
-				}
-			}
-			else
-				printk(KERN_EMERG "Class not found!\n");
-
-		}
-		else {
-			/* printk(KERN_EMERG "Error %d while recving Fb (EAGAIN = %d)\n",  */
-			/* 	   size, EAGAIN); */
+			
+			/* Set the stage counters */
+			cl->bcount_stg = 0;
+			cl->timer_stg = 0;
+			
+			/* Update the current rate, multiplicative decrease */
+			/* Changing the expression to avoid the use of floating
+			   point values */
+			dec_factor = (cl->crate * frame->Fb) >> QCN_GD;
+			dec_factor = max(cl->crate >> QCN_MIN_RATE_DEC, dec_factor);
+			cl->crate = max(cl->crate - dec_factor, (u32) QCN_MIN_RATE);
+			dec_factor = cl->crate;
+			spin_unlock(&cl->rate_lock);
+			printk(KERN_EMERG "QCN RP: New crate %d", dec_factor);
 		}
 	}
-
-out:
-	printk(KERN_EMERG THREAD_NAME": releasing socket\n");
-	sock_release(th->sock);
-	th->sock = NULL;
-	th->tsk = NULL;
-	return 0;
+	else
+		printk(KERN_EMERG "Class not found!\n");
 }
 
 /**
@@ -1294,21 +1193,6 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 	/* From iproute2/tc/tc_core.c */
 	q->clock_factor = (u32)NSEC_PER_USEC * 1000000 / (u32)PSCHED_TICKS2NS(1);
 
-	/* Creating the Feedback Controller thread */
-	memset(&q->th, 0, sizeof(struct qcn_kthread_t));
-	q->th.tsk = NULL;
-	q->th.sock = NULL;
-	q->th.tsk = kthread_create(qcn_feedback_controller, sch,
-					   THREAD_NAME);
-	if (IS_ERR(q->th.tsk)) {
-		printk(KERN_EMERG "Unable to start QCN Feedback Controller\n");
-		kfree(q->th.tsk);
-		q->th.tsk = NULL;
-	} else {
-		wake_up_process(q->th.tsk);
-	}
-
-
 	return 0;
 }
 
@@ -1495,12 +1379,6 @@ static void htb_destroy(struct Qdisc *sch)
 	struct hlist_node *n, *next;
 	struct htb_class *cl;
 	unsigned int i;
-
-	/* Destroying the QCN Feedback Controller Thread */
-	if (q->th.tsk == NULL)
-		printk(KERN_EMERG "QCN Feedback Controller is not running!");
-	else
-		kthread_stop(q->th.tsk);
 
 	cancel_work_sync(&q->work);
 	qdisc_watchdog_cancel(&q->watchdog);
@@ -1865,7 +1743,7 @@ static struct Qdisc_ops htb_qdisc_ops __read_mostly = {
 	.init		=	htb_init,
 	.reset		=	htb_reset,
 	.destroy	=	htb_destroy,
-	.change     =   NULL 		/* htb_change */,
+	.change     =   qcn_recv_fb,
 	.dump		=	htb_dump,
 	.owner		=	THIS_MODULE,
 };

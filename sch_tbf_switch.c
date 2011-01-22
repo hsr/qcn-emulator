@@ -22,19 +22,11 @@
 #include <net/pkt_sched.h>
 
 #include <linux/ip.h>
-#include <linux/list.h>
-#include <linux/semaphore.h>
-#include <linux/kthread.h>
-#include <linux/wait.h>
-#include <linux/sched.h>
+#include <linux/if_ether.h>
 
-#define LISTEN_PORT             6660
-#define THREAD_NAME             "QCNFbSender%x"
-#define FRAME_KFIFO_SIZE        32
 #define QCN_Q_EQ                33792 /* 33KB */
 #define QCN_W                   2
-
-#include "kfifo.c"
+#define ETH_QCN                 0xA9A9
 
 /*	Simple Token Bucket Filter.
 	=======================================
@@ -119,27 +111,6 @@ struct qcn_frame {
 	int qdelta;
 };
 
-/* struct qcn_frame_list { */
-/* 	struct qcn_frame frame; */
-/* 	struct list_head list; */
-/* }; */
-
-struct qcn_kthread_t {
-	struct task_struct *tsk;
-	struct sockaddr_in addr;
-	struct socket *sock;		/* Socket used to send Fb */
-	struct Qdisc *sch;			/* The scheduler itself */
-
-	/* struct qcn_frame_list frame_list; */
-
-	struct semaphore sem_frame_fifo;
-	/* DECLARE_KFIFO_PTR is available on kernels >= 2.6.37 */
-	DECLARE_KFIFO_PTR(frame_fifo, struct qcn_frame);
-	u32 frame_fifo_alloc;
-
-};
-
-
 struct tbf_sched_data {
     /* Parameters */
 	u32		limit;		/* Maximal length of backlog: bytes */
@@ -165,119 +136,10 @@ struct tbf_sched_data {
 	int qlen_old;
 	int sample;
 
-	struct qcn_kthread_t th;	/* Feedback Sender Thread */
-
 };
 
 #define L2T(q,L)   qdisc_l2t((q)->R_tab,L)
 #define L2T_P(q,L) qdisc_l2t((q)->P_tab,L)
-
-
-/* The right way to do the task of sending Fb is by using one queue
-   and one thread (producer-consumer). Don't use this qdisc on a
-   normal interface. It's developed to be attached on a bridged
-   iface. */
-static int qcn_send_fb (struct socket *sock, struct sockaddr_in *addr,
-						struct qcn_frame *frame, long ip_dst)
-{
-	struct msghdr msg;
-	struct iovec iov;
-	mm_segment_t oldfs;
-	int size = 0;
-
-
-	/* Connecting and sending the packet */
-	memset(addr, 0, sizeof(struct sockaddr));
-	addr->sin_family = AF_INET;
-	addr->sin_port = htons(LISTEN_PORT);
-	/* addr->sin_addr.s_addr = htonl(0x7f000001); */
-	addr->sin_addr.s_addr = (ip_dst & htonl(0xFFFF00FF)) | htonl(0x00000300);
-	/* The "AND 0xFFFF00FF" is a "workaround" to send the packet
-	   to the physical machine's IP instead of the virtual
-	   machine's IP (which was sampled). This code assumes that
-	   the VMs' IP addresses are assigned in such a way that each
-	   VM is placed on a PM which has an IP address equals to the
-	   VM IP address with the bits from 8 to 15 set to 0 (hence
-	   the AND 0xFFFF00FF). Such "workaround" is needed because we
-	   dont have a host directory that maps VMs->PMs within the
-	   kernel. */
-	if (sock->ops->connect(sock, (struct sockaddr *) addr,
-						   sizeof(struct sockaddr), 0) < 0) {
-		printk(KERN_EMERG "Could not connect to 0x%x qntz_Fb 0x%x", 
-			   addr->sin_addr.s_addr, frame->Fb);
-		return 0;
-	}
-	printk(KERN_EMERG "Connected to 0x%x qntz_Fb 0x%x", 
-		   addr->sin_addr.s_addr, frame->Fb);
-
-	if (sock->sk == NULL) 
-		return 0;
-		
-	iov.iov_base = frame;
-	iov.iov_len = sizeof(struct qcn_frame);
-		
-	msg.msg_name = addr;
-	msg.msg_namelen  = sizeof(struct sockaddr_in);
-	msg.msg_control = NULL;
-	msg.msg_controllen = 0;
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_control = NULL;
-	msg.msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL;
-
-	oldfs = get_fs();
-	set_fs(KERNEL_DS);
-	size = sock_sendmsg(sock, &msg, sizeof(struct qcn_frame));
-	set_fs(oldfs);
-
-	return size;
-}
-
-int qcn_feedback_sender(void *arg) {
-	struct Qdisc *sch = arg;
-	struct tbf_sched_data *q = qdisc_priv(sch);
-	struct qcn_kthread_t *th = &q->th;
-	struct qcn_frame frame;
-
-	printk(KERN_EMERG "%s: success!\n", th->tsk->comm);
-	set_user_nice(th->tsk, -20);
-
-	/* Creating a socket to recv udp messages */
-	if (sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &th->sock) < 0) {
-		printk(KERN_EMERG "%s: could not create the recv socket, error = %d\n",
-			   th->tsk->comm, -ENXIO);
-		goto out;
-	} else {
-		printk(KERN_EMERG "%s: socket created!", th->tsk->comm);
-	}
-
-	while (!kthread_should_stop()) {
-		if (down_timeout(&th->sem_frame_fifo, HZ/100) == 0) {
-			/* printk(KERN_EMERG "%s: acquired the lock!", th->tsk->comm); */
-
-			if (!kfifo_get(&th->frame_fifo, &frame))
-				printk(KERN_EMERG "%s: err while removing from kfifo",
-					   th->tsk->comm);
-			else if (qcn_send_fb(th->sock, &th->addr, &frame, frame.SA) <= 0)
-				printk(KERN_EMERG "%s: err while sending fb",
-					   th->tsk->comm);
-			else
-				printk(KERN_EMERG "%s: fb sent to %x",
-					   th->tsk->comm, frame.SA);
-
-		} else {
-			/* printk(KERN_EMERG "%s: down_timeout at proc %i!", */
-			/*	   th->tsk->comm, smp_processor_id()); */
-		}
-	}
-
-out:
-	printk(KERN_EMERG "%s: releasing socket\n", th->tsk->comm);
-	sock_release(th->sock);
-	th->sock = NULL;
-	th->tsk = NULL;
-	return 0;
-}
 
 static inline int mark_table(u32 qntz_Fb) {
 	switch (qntz_Fb >> 3) {
@@ -299,10 +161,12 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 	int ret;
 	unsigned int len = qdisc_pkt_len(skb);
 
-	int Fb;
-	struct iphdr *iph;
+	struct sk_buff *qcnskb;		/* QCN Congestion Message skb */
 	struct qcn_frame frame;
+	struct iphdr *iph;
+	struct ethhdr *ethh;
 	u32 qntz_Fb, generate_fb_frame;
+	int Fb;
 
 	if (len > q->max_size)
 		return qdisc_reshape_fail(skb, sch);
@@ -346,7 +210,7 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 		/* Since we are using IP addresses, we cant sample non-IP
 		   packets. */
 		
-		printk(KERN_EMERG "Sending Fb...");
+		/* printk(KERN_EMERG "Sending Fb..."); */
 				
 		/* Filling the qcn_frame structure */
 		memset(&frame, 0, sizeof(struct qcn_frame));
@@ -357,14 +221,27 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 		frame.qoff = htonl(QCN_Q_EQ - q->qlen);
 		frame.qdelta = htonl(q->qlen - q->qlen_old);
 
-		printk(KERN_EMERG "Fb %8x; qntz_Fb %8x; qlen %8x; qlen_old %8x",
-			   Fb, qntz_Fb, q->qlen, q->qlen_old);
+		/* printk(KERN_EMERG "Fb %8x; qntz_Fb %8x; qlen %8x; qlen_old %8x",
+			   Fb, qntz_Fb, q->qlen, q->qlen_old); */
 
-		if (!kfifo_put(&q->th.frame_fifo, &frame))
-			printk(KERN_EMERG "kfifo is full!");
-		else
-			up(&q->th.sem_frame_fifo);
-
+		ethh = eth_hdr(skb);
+		qcnskb = alloc_skb(64, GFP_ATOMIC);
+		/* initialization */
+		qcnskb->sk = NULL;
+		qcnskb->pkt_type = PACKET_OTHERHOST;
+		/* ether dst */
+		memcpy(skb_put(qcnskb, ETH_ALEN),ethh->h_source, ETH_ALEN);
+		/* ether src */
+		memcpy(skb_put(qcnskb, ETH_ALEN),ethh->h_dest, ETH_ALEN);
+		/* ether type */
+		*((__be16 *)skb_put(qcnskb, 2)) = htons(ETH_QCN);
+		memcpy(skb_put(qcnskb, sizeof(struct qcn_frame)),
+			   &frame,
+			   sizeof(struct qcn_frame));
+		/* checksum */
+		qcnskb->ip_summed = CHECKSUM_NONE;
+		memcpy(&qcnskb->dev, &skb->cb[24], sizeof(struct net_device *));
+		dev_queue_xmit(qcnskb);
 	}
 	/* End QCN Algorithm */
 
@@ -572,43 +449,12 @@ static int tbf_init(struct Qdisc* sch, struct nlattr *opt)
 	q->qlen_old = 0;
 	q->sample = 153600;
 
-	/* Creating the Feedback Sender Thread */
-	memset(&q->th, 0, sizeof(struct qcn_kthread_t));
-	q->th.tsk = NULL;
-	q->th.sock = NULL;
-	/* Thread's fifo queue, for qcn frames */
-	sema_init(&q->th.sem_frame_fifo, 0);
-	q->th.frame_fifo_alloc = 0;
-	if (kfifo_alloc(&q->th.frame_fifo, FRAME_KFIFO_SIZE, GFP_KERNEL)) {
-		printk(KERN_EMERG "error kfifo_alloc\n");
-		q->th.frame_fifo_alloc = 1;
-	}
-	/* printk(KERN_EMERG "creating thread at processor %i", */
-	/*          smp_processor_id()); */
-	q->th.tsk = kthread_create(qcn_feedback_sender, sch,
-							   THREAD_NAME, sch->handle);
-	if (IS_ERR(q->th.tsk)) {
-		printk(KERN_EMERG "Unable to start the Feedback Sender Thread\n");
-		kfree(q->th.tsk);
-		q->th.tsk = NULL;
-	} else {
-		wake_up_process(q->th.tsk);
-	}
-
 	return tbf_change(sch, opt);
 }
 
 static void tbf_destroy(struct Qdisc *sch)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
-
-	/* Destroying the Feedback Sender Thread */
-	if (q->th.tsk == NULL)
-		printk(KERN_EMERG "Feedback Sender Thread is not running!");
-	else
-		kthread_stop(q->th.tsk);
-	if (q->th.frame_fifo_alloc)
-		kfifo_free(&q->th.frame_fifo);
 
 	qdisc_watchdog_cancel(&q->watchdog);
 
