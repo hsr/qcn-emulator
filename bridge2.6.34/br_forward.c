@@ -21,6 +21,8 @@
 #include "br_private.h"
 
 #include <linux/if_ether.h>
+#include <linux/netdevice.h>
+#include <net/sch_generic.h>
 #define ETH_QCN                 0xA9A9
 
 static int deliver_clone(const struct net_bridge_port *prev,
@@ -77,6 +79,7 @@ static void __br_deliver(const struct net_bridge_port *to, struct sk_buff *skb)
 static void __br_forward(const struct net_bridge_port *to, struct sk_buff *skb)
 {
 	struct net_device *indev;
+
 	struct ethhdr *ethh = eth_hdr(skb);
 
 	if (skb_warn_if_lro(skb)) {
@@ -84,8 +87,8 @@ static void __br_forward(const struct net_bridge_port *to, struct sk_buff *skb)
 		return;
 	}
 
+	indev = skb->dev;
 	if (likely(ntohs(ethh->h_proto) != ETH_QCN)) {
-		indev = skb->dev;
 		skb->dev = to->dev;
 		skb_forward_csum(skb);
 
@@ -93,12 +96,12 @@ static void __br_forward(const struct net_bridge_port *to, struct sk_buff *skb)
 				br_forward_finish);
 	} else {
 		/* Intercept QCN packets being forwarded to vifs */
-		if (strncmp("vif", to->dev->name, 3) == 0 && 
-			strcmp("htb", &skb->dev->qdisc->ops->id) == 0 &&
-			skb->dev->qdisc->ops->change != NULL) {
+		if (strncmp("vif", to->dev->name, 3) == 0 &&
+			strcmp("htb", indev->qdisc->ops->id) == 0 && 
+			indev->qdisc->ops->change != NULL) {
 			/* Change QCN RP Rate */
-			skb->dev->qdisc->ops->change(skb->dev->qdisc,
-										 skb->data+sizeof(struct ethhdr));
+			indev->qdisc->ops->change(indev->qdisc, 
+				(struct nlattr *) skb->data + sizeof(struct ethhdr));
 		}
 		kfree(skb);
 	}
