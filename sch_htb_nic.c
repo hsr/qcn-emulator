@@ -839,19 +839,13 @@ static struct rb_node *htb_id_find_next_upper(int prio, struct rb_node *n,
 
 static int qcn_recv_fb(struct Qdisc *sch, struct nlattr *opt)
 {
-	struct htb_sched *q = qdisc_priv(sch);
 	struct qcn_frame *frame = (struct qcn_frame *)opt;
 	struct htb_class *cl;
 	u32 dec_factor;
-	int err, size;
 
-	size = qcn_recv_fb(th->sock, &th->addr, (char *)&frame,
-					   sizeof(struct qcn_frame));
-	
-	
-	printk(KERN_EMERG "Fb %x,src %x,dst %x,qoff %x,qd %x,hdl %x", 
-		   frame->Fb, frame->SA, frame->DA, frame->qoff, frame->qdelta,
-		   gethandle(frame->SA, frame->DA));
+	/* printk(KERN_EMERG "%8x; qntz_Fb %8x; qdelta %8x; qoff %8x\n",
+		   psched_get_time(), ntohl(frame->Fb), ntohl(frame->qdelta),
+		   ntohl(frame->qoff)); */
 		
 	if ((cl = htb_find(gethandle(frame->SA, frame->DA), sch)) != NULL) {
 		frame->Fb = ntohl(frame->Fb);
@@ -879,11 +873,14 @@ static int qcn_recv_fb(struct Qdisc *sch, struct nlattr *opt)
 			cl->crate = max(cl->crate - dec_factor, (u32) QCN_MIN_RATE);
 			dec_factor = cl->crate;
 			spin_unlock(&cl->rate_lock);
-			printk(KERN_EMERG "QCN RP: New crate %d", dec_factor);
+			/* printk(KERN_EMERG "QCN RP: New crate %d", dec_factor); */
+			return 1;
 		}
+		return -1;
 	}
-	else
-		printk(KERN_EMERG "Class not found!\n");
+	printk(KERN_INFO "Class not found!\n");
+	return -2;
+	
 }
 
 /**
@@ -1187,9 +1184,7 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 		q->rate2quantum = 1;
 	q->defcls = gopt->defcls;
 
-	/* QCN Variables */
-	printk(KERN_EMERG "Initializing QCN RP clock factor");
-
+	/* QCN RP Initialization */
 	/* From iproute2/tc/tc_core.c */
 	q->clock_factor = (u32)NSEC_PER_USEC * 1000000 / (u32)PSCHED_TICKS2NS(1);
 

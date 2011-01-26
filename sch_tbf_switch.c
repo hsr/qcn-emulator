@@ -24,9 +24,16 @@
 #include <linux/ip.h>
 #include <linux/if_ether.h>
 
-#define QCN_Q_EQ                33792 /* 33KB */
-#define QCN_W                   2
 #define ETH_QCN                 0xA9A9
+
+static int QCN_Q_EQ __read_mostly = 33792; /* 33KB */
+static int QCN_W    __read_mostly = 2;
+
+module_param    (QCN_Q_EQ, int, 0640);
+MODULE_PARM_DESC(QCN_Q_EQ, "QCN Congestion Point, parameter Q_EQ");
+
+module_param    (QCN_W, int, 0640);
+MODULE_PARM_DESC(QCN_W, "QCN Congestion Point, parameter W");
 
 /*	Simple Token Bucket Filter.
 	=======================================
@@ -127,13 +134,10 @@ struct tbf_sched_data {
 	struct Qdisc	*qdisc;		/* Inner qdisc, default - bfifo queue */
 	struct qdisc_watchdog watchdog;	/* Watchdog timer */
 
-	/* QCN Parameters */
-	int W;
-	int Q_EQ;
- 
 	/* QCN Variables */
-	int qlen;
-	int qlen_old;
+	int qcn_qlen;				/* QCN Queue length */
+	int qcn_qlen_old;			/* QCN Queue length at the time we
+								   sent the last Fb */
 	int sample;
 
 };
@@ -155,6 +159,33 @@ static inline int mark_table(u32 qntz_Fb) {
 	return 153600;
 }
 
+static struct sk_buff *qcnskb_create(struct sk_buff *skb, struct qcn_frame *frame)
+{
+	struct ethhdr *ethh;
+	struct sk_buff *qcnskb;
+
+	/* Initialization */
+	if ((qcnskb = alloc_skb(64, GFP_ATOMIC)) == NULL)
+		return NULL;	
+	qcnskb->sk = NULL;
+	qcnskb->pkt_type = PACKET_OTHERHOST;
+	/* checksum: we dont need any checksum */
+	qcnskb->ip_summed = CHECKSUM_NONE;
+
+	/* eth */
+	ethh = eth_hdr(skb);
+	memcpy(skb_put(qcnskb, ETH_ALEN),ethh->h_source, ETH_ALEN);
+	memcpy(skb_put(qcnskb, ETH_ALEN),ethh->h_dest, ETH_ALEN);
+	*((__be16 *)skb_put(qcnskb, 2)) = htons(ETH_QCN);
+	/* qcn */
+	memcpy(skb_put(qcnskb, sizeof(struct qcn_frame)),
+		   frame,
+		   sizeof(struct qcn_frame));
+	memcpy(&qcnskb->dev, &skb->cb[24], sizeof(struct net_device *));	
+
+	return qcnskb;
+}
+
 static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 {
 	struct tbf_sched_data *q = qdisc_priv(sch);
@@ -164,17 +195,23 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 	struct sk_buff *qcnskb;		/* QCN Congestion Message skb */
 	struct qcn_frame frame;
 	struct iphdr *iph;
-	struct ethhdr *ethh;
 	u32 qntz_Fb, generate_fb_frame;
 	int Fb;
 
 	if (len > q->max_size)
 		return qdisc_reshape_fail(skb, sch);
 
+	ret = qdisc_enqueue(skb, q->qdisc);
+	if (ret != 0) {
+		if (net_xmit_drop_count(ret))
+			sch->qstats.drops++;
+		return ret;
+	}
+
 	/* QCN Algorithm */
-	q->qlen += len;
+	q->qcn_qlen += len;
 	
-	Fb = (QCN_Q_EQ - q->qlen) - QCN_W * (q->qlen - q->qlen_old);
+	Fb = (QCN_Q_EQ - q->qcn_qlen) - QCN_W * (q->qcn_qlen - q->qcn_qlen_old);
 	if (Fb < -QCN_Q_EQ * (2 * QCN_W +1)) {
 		Fb = -QCN_Q_EQ * (2 * QCN_W +1);
 	}
@@ -184,7 +221,7 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 	/* The maximum value of -Fb determines the number of bits that Fb
 	   uses. Uniform quantization of -Fb, qntz_Fb, uses most
 	   significant bits of -Fb. Note that now qntz_Fb has positive
-	   values.  If Q_EQ = 32KB, W = 2, qlen = 160KB then the maximum
+	   values.  If Q_EQ = 32KB, W = 2, qcn_qlen = 160KB then the maximum
 	   value for -Fb is 457728, which can be represented using 19bits
 	   (110 1111 1100 0000 0000). To get the 6 most significant bits
 	   --- considering that -Fb will use at most 19 bits ---, we need
@@ -197,10 +234,7 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 	if (q->sample < 0) {
 		if (qntz_Fb > 0) {
 			generate_fb_frame = 1;
-			printk(KERN_WARNING "Generate feedback, Fb 0x%x, qntz_Fb 0x%x",
-				   Fb, qntz_Fb);
 		}
-		q->qlen_old = q->qlen;
 		/* TODO: random sampling */
 		q->sample = mark_table(qntz_Fb);
 	}
@@ -210,47 +244,28 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 		/* Since we are using IP addresses, we cant sample non-IP
 		   packets. */
 		
-		/* printk(KERN_EMERG "Sending Fb..."); */
-				
 		/* Filling the qcn_frame structure */
 		memset(&frame, 0, sizeof(struct qcn_frame));
 		iph = ip_hdr(skb);
 		frame.DA = iph->daddr;	/* Already in network byte order */
 		frame.SA = iph->saddr;	/* Already in network byte order */
 		frame.Fb = htonl(qntz_Fb);
-		frame.qoff = htonl(QCN_Q_EQ - q->qlen);
-		frame.qdelta = htonl(q->qlen - q->qlen_old);
+		frame.qoff = htonl(QCN_Q_EQ - q->qcn_qlen);
+		frame.qdelta = htonl(q->qcn_qlen - q->qcn_qlen_old);
 
-		/* printk(KERN_EMERG "Fb %8x; qntz_Fb %8x; qlen %8x; qlen_old %8x",
-			   Fb, qntz_Fb, q->qlen, q->qlen_old); */
-
-		ethh = eth_hdr(skb);
-		qcnskb = alloc_skb(64, GFP_ATOMIC);
-		/* initialization */
-		qcnskb->sk = NULL;
-		qcnskb->pkt_type = PACKET_OTHERHOST;
-		/* ether dst */
-		memcpy(skb_put(qcnskb, ETH_ALEN),ethh->h_source, ETH_ALEN);
-		/* ether src */
-		memcpy(skb_put(qcnskb, ETH_ALEN),ethh->h_dest, ETH_ALEN);
-		/* ether type */
-		*((__be16 *)skb_put(qcnskb, 2)) = htons(ETH_QCN);
-		memcpy(skb_put(qcnskb, sizeof(struct qcn_frame)),
-			   &frame,
-			   sizeof(struct qcn_frame));
-		/* checksum */
-		qcnskb->ip_summed = CHECKSUM_NONE;
-		memcpy(&qcnskb->dev, &skb->cb[24], sizeof(struct net_device *));
-		dev_queue_xmit(qcnskb);
+		if ((qcnskb = qcnskb_create(skb, &frame)) == NULL)
+			printk (KERN_ALERT "QCN err: qcnskb_create");
+		else if ((ret = dev_queue_xmit(qcnskb)) != NET_XMIT_SUCCESS)
+			printk(KERN_ALERT "QCN err: dev_queue_xmit");
+		else {
+			printk(KERN_EMERG "Fb %8x; qntz_Fb %8x; qcn_qlen %8d; \
+qcn_qlen_old %8d; qdelta %8d; qoff %8d\n", Fb, qntz_Fb, q->qcn_qlen, 
+				   q->qcn_qlen_old, q->qcn_qlen - q->qcn_qlen_old, 
+				   QCN_Q_EQ - q->qcn_qlen);
+			q->qcn_qlen_old = q->qcn_qlen;
+		}
 	}
 	/* End QCN Algorithm */
-
-	ret = qdisc_enqueue(skb, q->qdisc);
-	if (ret != 0) {
-		if (net_xmit_drop_count(ret))
-			sch->qstats.drops++;
-		return ret;
-	}
 
 	sch->q.qlen++;
 	sch->bstats.bytes += qdisc_pkt_len(skb);
@@ -264,6 +279,7 @@ static unsigned int tbf_drop(struct Qdisc* sch)
 	unsigned int len = 0;
 
 	if (q->qdisc->ops->drop && (len = q->qdisc->ops->drop(q->qdisc)) != 0) {
+		q->qcn_qlen -= len;
 		sch->q.qlen--;
 		sch->qstats.drops++;
 	}
@@ -305,11 +321,9 @@ static struct sk_buff *tbf_dequeue(struct Qdisc* sch)
 			q->t_c = now;
 			q->tokens = toks;
 			q->ptokens = ptoks;
-			sch->q.qlen--;
 			sch->flags &= ~TCQ_F_THROTTLED;
-
-			/* QCN: Update the queue len */
-			q->qlen -= len;
+			sch->q.qlen--;
+			q->qcn_qlen -= len;
 
 			return skb;
 		}
@@ -339,6 +353,7 @@ static void tbf_reset(struct Qdisc* sch)
 
 	qdisc_reset(q->qdisc);
 	sch->q.qlen = 0;
+	q->qcn_qlen = 0;
 	q->t_c = psched_get_time();
 	q->tokens = q->buffer;
 	q->ptokens = q->mtu;
@@ -409,6 +424,10 @@ static int tbf_change(struct Qdisc* sch, struct nlattr *opt)
 		qdisc_tree_decrease_qlen(q->qdisc, q->qdisc->q.qlen);
 		qdisc_destroy(q->qdisc);
 		q->qdisc = child;
+		/* Reinitializing QCN CP Variables */
+		q->qcn_qlen = 0;
+		q->qcn_qlen_old = 0;
+		q->sample = 153600;
 	}
 	q->limit = qopt->limit;
 	q->mtu = qopt->mtu;
@@ -441,12 +460,9 @@ static int tbf_init(struct Qdisc* sch, struct nlattr *opt)
 	qdisc_watchdog_init(&q->watchdog, sch);
 	q->qdisc = &noop_qdisc;
 
-	/* QCN Parameters */
-	printk(KERN_EMERG "Initializing QCN CP Variables");
-
-	/* Initializing variables */
-	q->qlen = 0;
-	q->qlen_old = 0;
+	/* Initializing QCN CP Variables */
+	q->qcn_qlen = 0;
+	q->qcn_qlen_old = 0;
 	q->sample = 153600;
 
 	return tbf_change(sch, opt);
@@ -472,6 +488,8 @@ static int tbf_dump(struct Qdisc *sch, struct sk_buff *skb)
 	struct nlattr *nest;
 	struct tc_tbf_qopt opt;
 
+	printk(KERN_ALERT "QCN: qcn_qlen %d\n", q->qcn_qlen);
+	
 	nest = nla_nest_start(skb, TCA_OPTIONS);
 	if (nest == NULL)
 		goto nla_put_failure;

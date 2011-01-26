@@ -79,7 +79,6 @@ static void __br_deliver(const struct net_bridge_port *to, struct sk_buff *skb)
 static void __br_forward(const struct net_bridge_port *to, struct sk_buff *skb)
 {
 	struct net_device *indev;
-
 	struct ethhdr *ethh = eth_hdr(skb);
 
 	if (skb_warn_if_lro(skb)) {
@@ -101,7 +100,7 @@ static void __br_forward(const struct net_bridge_port *to, struct sk_buff *skb)
 			indev->qdisc->ops->change != NULL) {
 			/* Change QCN RP Rate */
 			indev->qdisc->ops->change(indev->qdisc, 
-				(struct nlattr *) skb->data + sizeof(struct ethhdr));
+			   (struct nlattr *) skb->data);
 		}
 		kfree(skb);
 	}
