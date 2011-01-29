@@ -42,16 +42,57 @@
 
 #include <linux/ip.h>
 
+
 /* QCN Parameters (rates are always in bytes/sec) */
-#define QCN_TIMER          25*PSCHED_TICKS_PER_SEC/1000
-#define QCN_FASTREC        5
-#define QCN_BC             153600	 /* 150KB */
-#define QCN_AI             524288	 /* 0.5MB */
-#define QCN_HAI            5242880	 /* 5MB */
-#define QCN_GD             7		 /* 1/128 */
-#define QCN_MIN_RATE       524288	 /* 0.5MB */
-#define QCN_MIN_RATE_DEC   1		 /* = 1/2 */
-#define QCN_C              125000000 /* 1GB */
+
+/* #define QCN_TIMER          25*PSCHED_TICKS_PER_SEC/1000 */
+static int QCN_TIMER    __read_mostly = 25;
+/* #define QCN_FASTREC        5 */
+static int QCN_FASTREC  __read_mostly = 5;
+/* #define QCN_BC             153600	 /\* 150KB *\/ */
+static int QCN_BC       __read_mostly = 153600;
+/* #define QCN_AI             524288	 /\* 0.5MB *\/ */
+static int QCN_AI       __read_mostly = 524288;
+/* #define QCN_HAI            5242880	 /\* 5MB *\/ */
+static int QCN_HAI      __read_mostly = 5242880;
+/* #define QCN_GD             7		 /\* 1/128 *\/ */
+static int QCN_GD       __read_mostly = 7;
+/* #define QCN_MIN_RATE       524288	 /\* 0.5MB *\/ */
+static int QCN_MIN_RATE __read_mostly = 524288;
+/* #define QCN_MIN_RATE_DEC   1		 /\* = 1/2 *\/ */
+static int QCN_MIN_RATE_DEC __read_mostly = 1;
+
+module_param    (QCN_TIMER, int, 0640);
+MODULE_PARM_DESC(QCN_TIMER, "QCN Reaction Point, parameter TIMER (ms), "
+				 "default 25");
+
+module_param    (QCN_FASTREC, int, 0640);
+MODULE_PARM_DESC(QCN_FASTREC, "QCN Reaction Point, parameter FASTREC (stages), "
+				 "default 5");
+
+module_param    (QCN_BC, int, 0640);
+MODULE_PARM_DESC(QCN_BC, "QCN Reaction Point, parameter BC (bytes), "
+				 "default 153600");
+
+module_param    (QCN_AI, int, 0640);
+MODULE_PARM_DESC(QCN_AI, "QCN Reaction Point, parameter AI (bytes/s), "
+				 "default 524288");
+
+module_param    (QCN_HAI, int, 0640);
+MODULE_PARM_DESC(QCN_HAI, "QCN Reaction Point, parameter HAI (bytes/s), "
+				 "default 5242880");
+
+module_param    (QCN_GD, int, 0640);
+MODULE_PARM_DESC(QCN_GD, "QCN Reaction Point, parameter GD (Gain Dec.), "
+				 "default 7");
+
+module_param    (QCN_MIN_RATE, int, 0640);
+MODULE_PARM_DESC(QCN_MIN_RATE, "QCN Reaction Point, parameter MIN_RATE "
+				 "(bytes/s), default 524288");
+
+module_param    (QCN_MIN_RATE_DEC, int, 0640);
+MODULE_PARM_DESC(QCN_MIN_RATE_DEC, "QCN Reaction Point, parameter "
+				 "MIN_RATE_DEC, default 1");
 
 /* HTB algorithm.
     Author: devik@cdi.cz
@@ -141,6 +182,8 @@ struct htb_class {
 	spinlock_t rate_lock;
 	__u32 trate;			/* Target rate */
 	__u32 crate;			/* Current rate */
+	__u32 n,d;				/* Numerator, Denominator (to compute 
+							   proportional rates from rtab) */
 	__u32 bcount_tx;		/* Byte counter */
 	__u16 bcount_stg;		/* Byte counter stage (si_count) */
 	psched_time_t timer;	/* Timer */
@@ -187,7 +230,7 @@ struct htb_sched {
 	   # of tokens. However, this table is built in userspace. Therefore,
 	   when executing the QCN's Reaction Point algorithm, we ignore the rtable
 	   and translate pkt size to tokens by hand using the following variable. */
-	__u32 clock_factor;
+	/* __u32 clock_factor; */
 
 };
 
@@ -198,6 +241,17 @@ struct qcn_frame {
 	int qoff;
 	int qdelta;
 };
+
+static inline u32 gcd_fn(u32 a, u32 b) {
+    for(;;) {
+        a = a % b;
+		if(a == 0)
+			return b;
+		b = b % a;
+        if(b == 0)
+			return a;
+    }
+}
 
 /* Get qdisc handle from ip: parameters are 2 ip addresses in network
    byte order (big endian) */
@@ -629,6 +683,7 @@ static int htb_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 
 static inline void qcn_self_increase (struct htb_class *cl) {
 	u32 rate_increase;
+	u32 gcd;
 
 	if (cl->bcount_stg > QCN_FASTREC ||
 		cl->timer_stg > QCN_FASTREC) {
@@ -650,25 +705,38 @@ static inline void qcn_self_increase (struct htb_class *cl) {
 		cl->trate += rate_increase;
 	
 	cl->crate = (cl->trate + cl->crate) >> 1;
+
+	gcd = gcd_fn(cl->rate->rate.rate, cl->crate);
+	cl->n = cl->rate->rate.rate/gcd;
+	cl->d = cl->crate/gcd;
+
 }
 
+/* static inline long qdisc_l2t_clf(u32 rate, u32 size, u32 clock_factor) */
+/* { */
+/* 	/\* 3 is the default cell_log *\/ */
+/* 	u32 d = clock_factor/(rate >> 3); */
+/* 	u32 n = size >> 3; */
+/* 	return (d > 1) ? (long) n/d : (long) n; */
+/* } */
+
 static inline void htb_accnt_tokens(struct htb_class *cl, int bytes, 
-									long diff, __u32 clock_factor)
+									long diff)
 {
 	long toks = diff + cl->tokens;
+	long pkt2toks;
 	psched_time_t now;
 
 	if (toks > cl->buffer)
 		toks = cl->buffer;
 
-	if (cl->crate >= cl->rate->rate.rate)
-		toks -= (long) qdisc_l2t(cl->rate, bytes);
-	else {
+	pkt2toks = (long) qdisc_l2t(cl->rate, bytes);
+
+	/* QCN Reaction Point Algorithm */
+	if (cl->crate < cl->rate->rate.rate) {
 		spin_lock(&cl->rate_lock);
 
-		toks -= (long) (bytes/cl->crate) * clock_factor;
-
-		/* QCN Reaction Point Algorithm */
+		pkt2toks = (pkt2toks * cl->n)/cl->d;
 
 		/* Updating timer */
 		now = psched_get_time();
@@ -696,6 +764,8 @@ static inline void htb_accnt_tokens(struct htb_class *cl, int bytes,
 		spin_unlock(&cl->rate_lock);
 	}
 
+	toks -= pkt2toks;
+
 	if (toks <= -cl->mbuffer)
 		toks = 1 - cl->mbuffer;
 
@@ -703,18 +773,20 @@ static inline void htb_accnt_tokens(struct htb_class *cl, int bytes,
 }
 
 static inline void htb_accnt_ctokens(struct htb_class *cl, int bytes, 
-									 long diff, __u32 clock_factor)
+									 long diff)
 {
 	long toks = diff + cl->ctokens;
+	long pkt2toks;
 
 	if (toks > cl->cbuffer)
 		toks = cl->cbuffer;
 
-	if (cl->crate >= cl->rate->rate.rate)
-		toks -= (long) qdisc_l2t(cl->ceil, bytes);
-	else
+	pkt2toks = (long) qdisc_l2t(cl->ceil, bytes);
+	if (cl->crate < cl->rate->rate.rate)
 		/* Spinlock, where are you? */
-		toks -= (long) (bytes/cl->crate) * clock_factor;
+		pkt2toks = (pkt2toks * cl->n)/cl->d;
+
+	toks -= pkt2toks;	
 
 	if (toks <= -cl->mbuffer)
 		toks = 1 - cl->mbuffer;
@@ -745,12 +817,12 @@ static void htb_charge_class(struct htb_sched *q, struct htb_class *cl,
 		if (cl->level >= level) {
 			if (cl->level == level)
 				cl->xstats.lends++;
-			htb_accnt_tokens(cl, bytes, diff, q->clock_factor);
+			htb_accnt_tokens(cl, bytes, diff); /*, q->clock_factor);*/
 		} else {
 			cl->xstats.borrows++;
 			cl->tokens += diff;	/* we moved t_c; update tokens */
 		}
-		htb_accnt_ctokens(cl, bytes, diff, q->clock_factor);
+		htb_accnt_ctokens(cl, bytes, diff); /*, q->clock_factor);*/
 		cl->t_c = q->now;
 
 		old_mode = cl->cmode;
@@ -842,6 +914,8 @@ static int qcn_recv_fb(struct Qdisc *sch, struct nlattr *opt)
 	struct qcn_frame *frame = (struct qcn_frame *)opt;
 	struct htb_class *cl;
 	u32 dec_factor;
+	u32 new_crate;
+	u32 gcd;
 
 	/* printk(KERN_EMERG "%8x; qntz_Fb %8x; qdelta %8x; qoff %8x\n",
 		   psched_get_time(), ntohl(frame->Fb), ntohl(frame->qdelta),
@@ -871,9 +945,16 @@ static int qcn_recv_fb(struct Qdisc *sch, struct nlattr *opt)
 			dec_factor = (cl->crate * frame->Fb) >> QCN_GD;
 			dec_factor = max(cl->crate >> QCN_MIN_RATE_DEC, dec_factor);
 			cl->crate = max(cl->crate - dec_factor, (u32) QCN_MIN_RATE);
-			dec_factor = cl->crate;
+
+			gcd = gcd_fn(cl->rate->rate.rate, cl->crate);
+			cl->n = cl->rate->rate.rate/gcd;
+			cl->d = cl->crate/gcd;
+
+			new_crate = cl->crate;
 			spin_unlock(&cl->rate_lock);
-			/* printk(KERN_EMERG "QCN RP: New crate %d", dec_factor); */
+			/* printk(KERN_EMERG "%s rp: new crate %d, dec_factor %d, Fb %08x", 
+				   sch->dev_queue->dev->name, new_crate, dec_factor, 
+				   frame->Fb); */
 			return 1;
 		}
 		return -1;
@@ -1186,8 +1267,18 @@ static int htb_init(struct Qdisc *sch, struct nlattr *opt)
 
 	/* QCN RP Initialization */
 	/* From iproute2/tc/tc_core.c */
-	q->clock_factor = (u32)NSEC_PER_USEC * 1000000 / (u32)PSCHED_TICKS2NS(1);
+	/* q->clock_factor = ((u32)NSEC_PER_USEC * 1000000) / 
+		(u32)PSCHED_TICKS2NS(1); */
+	printk(KERN_ALERT "%s rp: init\n"
+		   "%s rp: QCN_TIMER %d; QCN_FASTREC %d; QCN_BC %d;\n"
+		   "%s rp: QCN_AI %d; QCN_HAI %d; QCN_GD %d, QCN_MIN_RATE %d;\n"
+		   "%s rp: QCN_MIN_RATE_DEC %d\n",
+		   sch->dev_queue->dev->name,
+		   sch->dev_queue->dev->name, QCN_TIMER, QCN_FASTREC, QCN_BC,
+		   sch->dev_queue->dev->name, QCN_AI, QCN_HAI, QCN_GD, QCN_MIN_RATE,
+		   sch->dev_queue->dev->name, QCN_MIN_RATE_DEC);
 
+	QCN_TIMER = QCN_TIMER * PSCHED_TICKS_PER_SEC/1000;
 	return 0;
 }
 
@@ -1633,6 +1724,21 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
 	/* QCN RP Rates Initialization */
 	cl->crate = cl->rate->rate.rate;
 	cl->trate = cl->rate->rate.rate;
+    cl->n = 1;
+	cl->d = 1;
+
+	/*gcd = gcd_fn(cl->rate->rate.rate, cl->crate);
+	cl->n = cl->rate->rate.rate/gcd;
+	cl->d = cl->crate/gcd;*/
+
+	/* printk(KERN_EMERG "%s rp: crate is %d, and rate is %d\n", 
+		   sch->dev_queue->dev->name, cl->crate, cl->rate->rate.rate);
+
+
+	printk(KERN_EMERG "%s rp: l2t %d, l2t_prop %d, l2t_clock_factor %d\n",
+		   sch->dev_queue->dev->name, qdisc_l2t(cl->rate, 60),
+		   qdisc_l2t(cl->rate, 60) * (cl->rate->rate.rate / cl->crate),
+		   (60>>3)/(q->clock_factor/(cl->rate->rate.rate>>3))); */
 
 	sch_tree_unlock(sch);
 

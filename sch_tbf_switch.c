@@ -140,6 +140,8 @@ struct tbf_sched_data {
 								   sent the last Fb */
 	int sample;
 
+	u32 qlen_pcount;
+	u32 qlen_plast;
 };
 
 #define L2T(q,L)   qdisc_l2t((q)->R_tab,L)
@@ -157,6 +159,15 @@ static inline int mark_table(u32 qntz_Fb) {
 	case 7: return 18944;
 	}
 	return 153600;
+}
+
+static inline void qcn_init(struct tbf_sched_data *q) {
+	q->qcn_qlen = 0;
+	q->qcn_qlen_old = 0;
+	q->sample = 153600;
+
+	q->qlen_pcount = 0;
+	q->qlen_plast = 0;
 }
 
 static struct sk_buff *qcnskb_create(struct sk_buff *skb, struct qcn_frame *frame)
@@ -258,14 +269,27 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 		else if ((ret = dev_queue_xmit(qcnskb)) != NET_XMIT_SUCCESS)
 			printk(KERN_ALERT "QCN err: dev_queue_xmit");
 		else {
-			printk(KERN_EMERG "Fb %8x; qntz_Fb %8x; qcn_qlen %8d; \
+			/* printk(KERN_ALERT "Fb %8x; qntz_Fb %8x; qcn_qlen %8d;		\
 qcn_qlen_old %8d; qdelta %8d; qoff %8d\n", Fb, qntz_Fb, q->qcn_qlen, 
 				   q->qcn_qlen_old, q->qcn_qlen - q->qcn_qlen_old, 
-				   QCN_Q_EQ - q->qcn_qlen);
+				   QCN_Q_EQ - q->qcn_qlen); */
 			q->qcn_qlen_old = q->qcn_qlen;
 		}
 	}
 	/* End QCN Algorithm */
+
+	
+
+
+	if (((u32)jiffies) == q->qlen_plast)
+		q->qlen_pcount += 1;
+	else {
+		q->qlen_pcount = 0;
+		q->qlen_plast = (u32)jiffies;
+	}
+		
+	printk(KERN_INFO "%s: qlen %u.%u %d", sch->dev_queue->dev->name,
+		   q->qlen_plast, q->qlen_pcount, q->qcn_qlen);
 
 	sch->q.qlen++;
 	sch->bstats.bytes += qdisc_pkt_len(skb);
@@ -353,7 +377,7 @@ static void tbf_reset(struct Qdisc* sch)
 
 	qdisc_reset(q->qdisc);
 	sch->q.qlen = 0;
-	q->qcn_qlen = 0;
+	qcn_init(q);
 	q->t_c = psched_get_time();
 	q->tokens = q->buffer;
 	q->ptokens = q->mtu;
@@ -425,9 +449,7 @@ static int tbf_change(struct Qdisc* sch, struct nlattr *opt)
 		qdisc_destroy(q->qdisc);
 		q->qdisc = child;
 		/* Reinitializing QCN CP Variables */
-		q->qcn_qlen = 0;
-		q->qcn_qlen_old = 0;
-		q->sample = 153600;
+		qcn_init(q);
 	}
 	q->limit = qopt->limit;
 	q->mtu = qopt->mtu;
@@ -461,9 +483,9 @@ static int tbf_init(struct Qdisc* sch, struct nlattr *opt)
 	q->qdisc = &noop_qdisc;
 
 	/* Initializing QCN CP Variables */
-	q->qcn_qlen = 0;
-	q->qcn_qlen_old = 0;
-	q->sample = 153600;
+	qcn_init(q);
+	
+	printk(KERN_INFO "%s: init", sch->dev_queue->dev->name);
 
 	return tbf_change(sch, opt);
 }
@@ -488,7 +510,7 @@ static int tbf_dump(struct Qdisc *sch, struct sk_buff *skb)
 	struct nlattr *nest;
 	struct tc_tbf_qopt opt;
 
-	printk(KERN_ALERT "QCN: qcn_qlen %d\n", q->qcn_qlen);
+	/* printk(KERN_ALERT "QCN: qcn_qlen %d\n", q->qcn_qlen); */
 	
 	nest = nla_nest_start(skb, TCA_OPTIONS);
 	if (nest == NULL)

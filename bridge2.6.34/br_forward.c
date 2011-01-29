@@ -104,7 +104,6 @@ static void __br_forward(const struct net_bridge_port *to, struct sk_buff *skb)
 		}
 		kfree(skb);
 	}
-	
 }
 
 /* called with rcu_read_lock */

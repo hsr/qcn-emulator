@@ -1,3 +1,4 @@
+
 #!/bin/bash
 
 function substrr {
@@ -53,7 +54,7 @@ function add_rp {
 
 	echo "Adding RP Class..."
 	tc class add dev ${IFACE} parent root classid 1:${HANDLE} htb \
-		rate ${RATE} ceil ${RATE} burst 1500kb cburst 1500kb;
+		rate ${RATE} ceil ${RATE} burst 1500kb cburst 1500kb quantum 3000;
 
 	echo "Adding RP Qdisc..."
 	tc qdisc add dev ${IFACE} parent 1:${HANDLE} handle ${HANDLE}: \
