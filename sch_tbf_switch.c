@@ -23,6 +23,7 @@
 
 #include <linux/ip.h>
 #include <linux/if_ether.h>
+#include <asm/msr.h>
 
 #define ETH_QCN                 0xA9A9
 
@@ -139,9 +140,7 @@ struct tbf_sched_data {
 	int qcn_qlen_old;			/* QCN Queue length at the time we
 								   sent the last Fb */
 	int sample;
-
-	u32 qlen_pcount;
-	u32 qlen_plast;
+	u32 generate_fb_frame;
 };
 
 #define L2T(q,L)   qdisc_l2t((q)->R_tab,L)
@@ -165,9 +164,7 @@ static inline void qcn_init(struct tbf_sched_data *q) {
 	q->qcn_qlen = 0;
 	q->qcn_qlen_old = 0;
 	q->sample = 153600;
-
-	q->qlen_pcount = 0;
-	q->qlen_plast = 0;
+	q->generate_fb_frame = 0;
 }
 
 static struct sk_buff *qcnskb_create(struct sk_buff *skb, struct qcn_frame *frame)
@@ -206,8 +203,9 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 	struct sk_buff *qcnskb;		/* QCN Congestion Message skb */
 	struct qcn_frame frame;
 	struct iphdr *iph;
-	u32 qntz_Fb, generate_fb_frame;
+	u32 qntz_Fb, qntz_Fb_sent;
 	int Fb;
+	u64 tsc64;
 
 	if (len > q->max_size)
 		return qdisc_reshape_fail(skb, sch);
@@ -238,19 +236,19 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 	   --- considering that -Fb will use at most 19 bits ---, we need
 	   to discard the 13 least significant bits (>> 13).
 	*/
-	qntz_Fb = ((u32) -Fb) >> 13;
+	qntz_Fb = 0x3F & (((u32) -Fb) >> 13);
 	
-	generate_fb_frame = 0;
 	q->sample -= len;
 	if (q->sample < 0) {
 		if (qntz_Fb > 0) {
-			generate_fb_frame = 1;
+			q->generate_fb_frame = 1;
 		}
+		q->qcn_qlen_old = q->qcn_qlen;
 		/* TODO: random sampling */
 		q->sample = mark_table(qntz_Fb);
 	}
 	
-	if (generate_fb_frame && skb && skb->network_header &&
+	if (q->generate_fb_frame && skb && skb->network_header &&
 		(skb->protocol == __constant_htons(ETH_P_IP))) {
 		/* Since we are using IP addresses, we cant sample non-IP
 		   packets. */
@@ -268,28 +266,19 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 			printk (KERN_ALERT "QCN err: qcnskb_create");
 		else if ((ret = dev_queue_xmit(qcnskb)) != NET_XMIT_SUCCESS)
 			printk(KERN_ALERT "QCN err: dev_queue_xmit");
-		else {
-			/* printk(KERN_ALERT "Fb %8x; qntz_Fb %8x; qcn_qlen %8d;		\
-qcn_qlen_old %8d; qdelta %8d; qoff %8d\n", Fb, qntz_Fb, q->qcn_qlen, 
-				   q->qcn_qlen_old, q->qcn_qlen - q->qcn_qlen_old, 
-				   QCN_Q_EQ - q->qcn_qlen); */
-			q->qcn_qlen_old = q->qcn_qlen;
+		else {			
+			q->generate_fb_frame = 0;
+			qntz_Fb_sent = qntz_Fb;
 		}
 	}
 	/* End QCN Algorithm */
+	else
+		qntz_Fb_sent = 0;
 
-	
-
-
-	if (((u32)jiffies) == q->qlen_plast)
-		q->qlen_pcount += 1;
-	else {
-		q->qlen_pcount = 0;
-		q->qlen_plast = (u32)jiffies;
-	}
-		
-	printk(KERN_INFO "%s: qlen %u.%u %d", sch->dev_queue->dev->name,
-		   q->qlen_plast, q->qlen_pcount, q->qcn_qlen);
+	rdtscll(tsc64);
+	printk(KERN_INFO "%llu %s: QLEN %d TOKS %ld Fb %u",
+		   tsc64, sch->dev_queue->dev->name, q->qcn_qlen, 
+		   q->tokens, qntz_Fb_sent);
 
 	sch->q.qlen++;
 	sch->bstats.bytes += qdisc_pkt_len(skb);
