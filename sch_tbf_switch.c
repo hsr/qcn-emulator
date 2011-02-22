@@ -146,7 +146,8 @@ struct tbf_sched_data {
 #define L2T(q,L)   qdisc_l2t((q)->R_tab,L)
 #define L2T_P(q,L) qdisc_l2t((q)->P_tab,L)
 
-static inline int mark_table(u32 qntz_Fb) {
+static inline int qcn_mark_table(u32 qntz_Fb)
+{
 	switch (qntz_Fb >> 3) {
 	case 0: return 153600;
 	case 1:	return 76800;
@@ -160,17 +161,26 @@ static inline int mark_table(u32 qntz_Fb) {
 	return 153600;
 }
 
-static inline void qcn_init(struct tbf_sched_data *q) {
+static inline void qcn_init(struct tbf_sched_data *q)
+{
 	q->qcn_qlen = 0;
 	q->qcn_qlen_old = 0;
 	q->sample = 153600;
 	q->generate_fb_frame = 0;
 }
 
-static struct sk_buff *qcnskb_create(struct sk_buff *skb, struct qcn_frame *frame)
+static struct sk_buff *qcnskb_create(struct sk_buff *skb, 
+									 struct qcn_frame *frame)
 {
 	struct ethhdr *ethh;
 	struct sk_buff *qcnskb;
+	struct net_device *indev;
+
+	memcpy(&indev, &skb->cb[24], sizeof(struct net_device *));
+	if (indev->name[4] != '\0') {
+		printk("QCN err: qcnskb_create, indev->name size != 4");
+		return NULL;
+	}
 
 	/* Initialization */
 	if ((qcnskb = alloc_skb(64, GFP_ATOMIC)) == NULL)
@@ -189,17 +199,14 @@ static struct sk_buff *qcnskb_create(struct sk_buff *skb, struct qcn_frame *fram
 	memcpy(skb_put(qcnskb, sizeof(struct qcn_frame)),
 		   frame,
 		   sizeof(struct qcn_frame));
-	memcpy(&qcnskb->dev, &skb->cb[24], sizeof(struct net_device *));	
+	memcpy(&qcnskb->dev, &skb->cb[24], sizeof(struct net_device *));
 
 	return qcnskb;
 }
 
-static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
+static inline void qcn_algorithm(struct Qdisc* sch, struct tbf_sched_data *q,
+								 struct sk_buff *skb, unsigned int len)
 {
-	struct tbf_sched_data *q = qdisc_priv(sch);
-	int ret;
-	unsigned int len = qdisc_pkt_len(skb);
-
 	struct sk_buff *qcnskb;		/* QCN Congestion Message skb */
 	struct qcn_frame frame;
 	struct iphdr *iph;
@@ -207,17 +214,6 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 	int Fb;
 	u64 tsc64;
 
-	if (len > q->max_size)
-		return qdisc_reshape_fail(skb, sch);
-
-	ret = qdisc_enqueue(skb, q->qdisc);
-	if (ret != 0) {
-		if (net_xmit_drop_count(ret))
-			sch->qstats.drops++;
-		return ret;
-	}
-
-	/* QCN Algorithm */
 	q->qcn_qlen += len;
 	
 	Fb = (QCN_Q_EQ - q->qcn_qlen) - QCN_W * (q->qcn_qlen - q->qcn_qlen_old);
@@ -245,7 +241,9 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 		}
 		q->qcn_qlen_old = q->qcn_qlen;
 		/* TODO: random sampling */
-		q->sample = mark_table(qntz_Fb);
+		q->sample = qcn_mark_table(qntz_Fb);
+		if (q->generate_fb_frame == 1)
+			printk("New sample: %d\tFb %u\n", q->sample, qntz_Fb);
 	}
 	
 	if (q->generate_fb_frame && skb && skb->network_header &&
@@ -263,10 +261,10 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 		frame.qdelta = htonl(q->qcn_qlen - q->qcn_qlen_old);
 
 		if ((qcnskb = qcnskb_create(skb, &frame)) == NULL)
-			printk (KERN_ALERT "QCN err: qcnskb_create");
-		else if ((ret = dev_queue_xmit(qcnskb)) != NET_XMIT_SUCCESS)
+			printk(KERN_ALERT "QCN err: qcnskb_create");
+		else if (dev_queue_xmit(qcnskb) != NET_XMIT_SUCCESS)
 			printk(KERN_ALERT "QCN err: dev_queue_xmit");
-		else {			
+		else {
 			q->generate_fb_frame = 0;
 			qntz_Fb_sent = qntz_Fb;
 		}
@@ -276,9 +274,30 @@ static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 		qntz_Fb_sent = 0;
 
 	rdtscll(tsc64);
-	printk(KERN_INFO "%llu %s: QLEN %d TOKS %ld Fb %u",
-		   tsc64, sch->dev_queue->dev->name, q->qcn_qlen, 
+	printk(KERN_INFO "tbf %llu %s: QLEN %d TOKS %ld Fb %u\n",
+		   tsc64, sch->dev_queue->dev->name, q->qcn_qlen,
 		   q->tokens, qntz_Fb_sent);
+
+}
+
+static int tbf_enqueue(struct sk_buff *skb, struct Qdisc* sch)
+{
+	struct tbf_sched_data *q = qdisc_priv(sch);
+	int ret;
+	unsigned int len = qdisc_pkt_len(skb);
+
+	if (len > q->max_size)
+		return qdisc_reshape_fail(skb, sch);
+
+	ret = qdisc_enqueue(skb, q->qdisc);
+	if (ret != 0) {
+		if (net_xmit_drop_count(ret))
+			sch->qstats.drops++;
+		return ret;
+	}
+
+	/* QCN */
+	qcn_algorithm(sch, q, skb, len);
 
 	sch->q.qlen++;
 	sch->bstats.bytes += qdisc_pkt_len(skb);
@@ -473,8 +492,7 @@ static int tbf_init(struct Qdisc* sch, struct nlattr *opt)
 
 	/* Initializing QCN CP Variables */
 	qcn_init(q);
-	
-	printk(KERN_INFO "%s: init", sch->dev_queue->dev->name);
+	printk(KERN_INFO "%s: init\n", sch->dev_queue->dev->name);
 
 	return tbf_change(sch, opt);
 }

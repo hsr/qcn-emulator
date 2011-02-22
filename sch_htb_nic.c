@@ -41,7 +41,7 @@
 #include <net/pkt_sched.h>
 
 #include <linux/ip.h>
-
+#include <asm/msr.h>
 
 /* QCN Parameters (rates are always in bytes/sec) */
 
@@ -712,20 +712,15 @@ static inline void qcn_self_increase (struct htb_class *cl) {
 
 }
 
-/* static inline long qdisc_l2t_clf(u32 rate, u32 size, u32 clock_factor) */
-/* { */
-/* 	/\* 3 is the default cell_log *\/ */
-/* 	u32 d = clock_factor/(rate >> 3); */
-/* 	u32 n = size >> 3; */
-/* 	return (d > 1) ? (long) n/d : (long) n; */
-/* } */
-
 static inline void htb_accnt_tokens(struct htb_class *cl, int bytes, 
 									long diff)
 {
 	long toks = diff + cl->tokens;
 	long pkt2toks;
 	psched_time_t now;
+	u64 tsc64;
+	u32 new_crate, new_trate, bs, ts;
+	u32 handle;
 
 	if (toks > cl->buffer)
 		toks = cl->buffer;
@@ -760,14 +755,34 @@ static inline void htb_accnt_tokens(struct htb_class *cl, int bytes,
 		}
 		else
 			cl->bcount_tx -= bytes;
-			
+
+		new_crate = cl->crate;
+		new_trate = cl->trate;
+		bs = cl->bcount_stg;
+		ts = cl->timer_stg;
 		spin_unlock(&cl->rate_lock);
+	} else {
+		new_crate = cl->rate->rate.rate;
+		new_trate = cl->rate->rate.rate;
+		bs = 0;
+		ts = 0;
 	}
 
 	toks -= pkt2toks;
 
 	if (toks <= -cl->mbuffer)
 		toks = 1 - cl->mbuffer;
+
+	handle = cl->un.leaf.q->handle >> 16;
+	rdtscll(tsc64);
+	printk(KERN_INFO "htb %llu %x: QLEN %d TOKS %ld CR %d TR %d Fb 0 "
+		   "BS %d TS %d\n",
+		   tsc64, cl->un.leaf.q->handle >> 16,
+		   cl->un.leaf.q->q.qlen, toks, new_crate*8/1000/1000,
+		   new_trate*8/1000/1000, bs, ts);
+	/*printk(KERN_INFO "htb %llu %x: QLEN %d\n",
+		   tsc64, handle,
+		   cl->un.leaf.q->q.qlen);*/
 
 	cl->tokens = toks;
 }
@@ -914,8 +929,9 @@ static int qcn_recv_fb(struct Qdisc *sch, struct nlattr *opt)
 	struct qcn_frame *frame = (struct qcn_frame *)opt;
 	struct htb_class *cl;
 	u32 dec_factor;
-	u32 new_crate;
+	u32 new_crate, new_trate, bs, ts;
 	u32 gcd;
+	u64 tsc64;
 
 	/* printk(KERN_EMERG "%8x; qntz_Fb %8x; qdelta %8x; qoff %8x\n",
 		   psched_get_time(), ntohl(frame->Fb), ntohl(frame->qdelta),
@@ -951,10 +967,22 @@ static int qcn_recv_fb(struct Qdisc *sch, struct nlattr *opt)
 			cl->d = cl->crate/gcd;
 
 			new_crate = cl->crate;
+			new_trate = cl->trate;
+			bs = cl->bcount_stg;
+			ts = cl->timer_stg;
 			spin_unlock(&cl->rate_lock);
 			/* printk(KERN_EMERG "%s rp: new crate %d, dec_factor %d, Fb %08x", 
 				   sch->dev_queue->dev->name, new_crate, dec_factor, 
 				   frame->Fb); */
+
+			rdtscll(tsc64);
+			printk(KERN_INFO "htb %llu %x: QLEN %d TOKS %ld CR %d"
+				   " TR %d Fb %d BS %d TS %d\n", tsc64, 
+				   cl->un.leaf.q->handle >> 16, 
+				   cl->un.leaf.q->q.qlen, cl->tokens, 
+				   new_crate*8/1000/1000, new_trate*8/1000/1000,
+				   frame->Fb, bs, ts);
+
 			return 1;
 		}
 		return -1;
